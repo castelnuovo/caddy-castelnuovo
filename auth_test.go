@@ -463,6 +463,20 @@ func TestUnavailableIdentityProviderKeepsSession(t *testing.T) {
 		t.Fatalf("after recovery: %d", resp.StatusCode)
 	}
 
+	idp.refreshErr = fmt.Errorf("%w: internal server error", errUnavailable)
+	now = now.Add(refreshInterval)
+	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("while unavailable again: %d", resp.StatusCode)
+	}
+	now = now.Add(maxOutage)
+	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusFound {
+		t.Fatalf("after a long outage: %d", resp.StatusCode)
+	}
+	idp.refreshErr = nil
+	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusFound {
+		t.Fatalf("after a long outage ended the session: %d", resp.StatusCode)
+	}
+
 	idp.exchangeErr = fmt.Errorf("%w: connection refused", errUnavailable)
 	if resp := logIn(t, s, cert); resp.StatusCode != http.StatusBadGateway || cookie(resp, sessionCookie) != nil {
 		t.Fatalf("login while unavailable: %d", resp.StatusCode)

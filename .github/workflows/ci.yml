@@ -57,9 +57,6 @@ jobs:
     needs: [test, build, verify]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    concurrency:
-      group: publish
-      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -88,7 +85,8 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
       - run: |
-          if [ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)" = "$GITHUB_SHA" ]; then
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)
+          if [ "$head" = "$GITHUB_SHA" ]; then
             docker push "$IMAGE:latest"
           else
             echo "::notice::$GITHUB_REF_NAME has moved on, so $GITHUB_SHA is not tagged latest"

@@ -92,7 +92,7 @@ Each login has to come from an `id.castelnuovo.eu` session that started with a p
 
 Without a valid session, page loads are redirected to the login. Other requests, such as `fetch` calls, WebSockets and anything other than GET, get a 401. To send users to the login yourself, link to `/.castelnuovo/login?rd=/path`.
 
-Sessions last at most 12 hours. Every 5 minutes a session refreshes its tokens at `id.castelnuovo.eu`, which refuses the refresh once the user is disabled, deleted or no longer in an allowed group. The session then ends. If `id.castelnuovo.eu` cannot be reached, requests get a 502 and the session stays, so it works again once the refresh succeeds. Sessions live in memory, so a config reload keeps them as long as `client_id` stays the same, and a restart logs everyone out.
+Sessions last at most 12 hours. Every 5 minutes a session refreshes its tokens at `id.castelnuovo.eu`, which refuses the refresh once the user is disabled, deleted or no longer in an allowed group. The session then ends. If `id.castelnuovo.eu` cannot be reached, requests get a 502 and the session stays, so it works again once the refresh succeeds. When refreshes keep failing for 10 minutes, the session ends. Sessions live in memory, so a config reload keeps them as long as `client_id` stays the same, and a restart logs everyone out.
 
 All `castelnuovo.eu` sites count as the same site for cookies, so the session cookie's `SameSite` setting does not stop requests coming from another `castelnuovo.eu` site. Your app needs its own CSRF protection for requests that change data.
 

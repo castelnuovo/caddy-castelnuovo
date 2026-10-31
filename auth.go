@@ -30,6 +30,7 @@ const (
 	maxAuthAge      = time.Hour
 	refreshInterval = 5 * time.Minute
 	retryInterval   = 10 * time.Second
+	maxOutage       = 10 * time.Minute
 	sessionLifetime = 12 * time.Hour
 	loginTimeout    = 10 * time.Minute
 
@@ -70,6 +71,7 @@ type session struct {
 	refreshToken   string
 	refreshedAt    time.Time
 	failedAt       time.Time
+	failingSince   time.Time
 	expiresAt      time.Time
 }
 
@@ -229,6 +231,12 @@ func (m *Auth) refresh(ctx context.Context, sess *session) error {
 	c, refreshToken, err := m.idp.refresh(ctx, sess.refreshToken)
 	switch {
 	case errors.Is(err, errUnavailable):
+		if sess.failingSince.IsZero() {
+			sess.failingSince = m.now()
+		}
+		if m.now().Sub(sess.failingSince) >= maxOutage {
+			return fmt.Errorf("refresh kept failing for %s: %v", maxOutage, err)
+		}
 		sess.failedAt = m.now()
 		return err
 	case err != nil:
@@ -236,7 +244,7 @@ func (m *Auth) refresh(ctx context.Context, sess *session) error {
 	case c.Subject != sess.sub:
 		return errors.New("refresh returned another user")
 	}
-	sess.claims, sess.refreshToken, sess.refreshedAt = c, refreshToken, m.now()
+	sess.claims, sess.refreshToken, sess.refreshedAt, sess.failingSince = c, refreshToken, m.now(), time.Time{}
 	return nil
 }
 

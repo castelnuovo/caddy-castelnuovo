@@ -39,7 +39,7 @@ const (
 	logoutPath   = "/.castelnuovo/logout"
 )
 
-var yubikeyURI = regexp.MustCompile(`^spiffe://castelnuovo\.eu/yubikey/[0-9]+/owner/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
+var certificateURI = regexp.MustCompile(`^spiffe://castelnuovo\.eu/yubikey/[0-9]+/owner/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
 
 type claims struct {
 	Subject           string   `json:"sub"`
@@ -120,7 +120,7 @@ func (m *Auth) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.
 	}
 	sessionID, login := removeCookies(r)
 
-	uri, err := m.yubikey(r)
+	uri, err := m.certificate(r)
 	if err != nil {
 		return m.deny(r, http.StatusForbidden, err)
 	}
@@ -133,8 +133,10 @@ func (m *Auth) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.
 		return m.callback(w, r, uri, login)
 	case path == logoutPath && r.Method == http.MethodPost:
 		return m.logout(w, r, sessionID)
-	case path == loginPath || path == callbackPath || path == logoutPath:
-		return caddyhttp.Error(http.StatusMethodNotAllowed, fmt.Errorf("%s is not allowed", r.Method))
+	case path == loginPath || path == callbackPath:
+		return caddyhttp.Error(http.StatusMethodNotAllowed, fmt.Errorf("%s only accepts GET", path))
+	case path == logoutPath:
+		return caddyhttp.Error(http.StatusMethodNotAllowed, fmt.Errorf("%s only accepts POST", path))
 	}
 
 	c := m.verify(r, uri, sessionID)
@@ -149,16 +151,19 @@ func (m *Auth) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.
 	return next.ServeHTTP(w, r)
 }
 
-func (m *Auth) yubikey(r *http.Request) (string, error) {
-	if m.DisableYubikey {
+func (m *Auth) certificate(r *http.Request) (string, error) {
+	if m.DisableClientCertificate {
 		return "", nil
 	}
 	var uri string
 	if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0][0].URIs) > 0 {
 		uri = r.TLS.VerifiedChains[0][0].URIs[0].String()
 	}
-	if !yubikeyURI.MatchString(uri) {
-		return "", fmt.Errorf("a YubiKey certificate is required, got %q", uri)
+	switch {
+	case uri == "":
+		return "", errors.New("a client certificate is required")
+	case !certificateURI.MatchString(uri):
+		return "", fmt.Errorf("%s is not an allowed client certificate", uri)
 	}
 	return uri, nil
 }
@@ -199,7 +204,7 @@ func (m *Auth) refresh(ctx context.Context, sess *session) error {
 
 func challenge(w http.ResponseWriter, r *http.Request) error {
 	if r.Method != http.MethodGet {
-		return caddyhttp.Error(http.StatusUnauthorized, errors.New("authentication required"))
+		return caddyhttp.Error(http.StatusUnauthorized, errors.New("login required"))
 	}
 	http.Redirect(w, r, loginPath+"?rd="+url.QueryEscape(original(r).RequestURI()), http.StatusFound)
 	return nil
@@ -224,7 +229,12 @@ func (m *Auth) callback(w http.ResponseWriter, r *http.Request, uri, login strin
 		err = json.Unmarshal(value, &l)
 	}
 	query := original(r).Query()
-	if err != nil || l.State == "" || l.State != query.Get("state") {
+	switch {
+	case login == "":
+		return m.deny(r, http.StatusBadRequest, errors.New("login cookie is missing"))
+	case err != nil || l.State == "":
+		return m.deny(r, http.StatusBadRequest, errors.New("login cookie is invalid"))
+	case l.State != query.Get("state"):
 		return m.deny(r, http.StatusBadRequest, errors.New("state does not match the login cookie"))
 	}
 	setCookie(w, loginCookie, "", -time.Second)
@@ -247,7 +257,7 @@ func (m *Auth) callback(w http.ResponseWriter, r *http.Request, uri, login strin
 		expiresAt:    now.Add(sessionLifetime),
 	}, now)
 
-	m.log.Info("login", zap.String("user", c.PreferredUsername), zap.String("host", r.Host), zap.String("uri", uri))
+	m.log.Info("user logged in", zap.String("user", c.PreferredUsername), zap.String("host", r.Host), zap.String("certificate", uri))
 	setCookie(w, sessionCookie, id, sessionLifetime)
 	if !isLocalPath(l.Redirect) {
 		l.Redirect = "/"
@@ -259,15 +269,15 @@ func (m *Auth) callback(w http.ResponseWriter, r *http.Request, uri, login strin
 func (m *Auth) checkLogin(c *claims, nonce, uri string) error {
 	switch {
 	case c.Subject == "":
-		return errors.New("id token has no subject")
+		return errors.New("ID token has no subject")
 	case c.Nonce != nonce:
-		return errors.New("id token nonce does not match")
+		return errors.New("ID token nonce does not match")
 	case !slices.Contains(c.AMR, "phr"):
 		return fmt.Errorf("%s did not log in with a passkey", c.PreferredUsername)
 	case m.now().Sub(time.Unix(c.AuthTime, 0)) > maxAuthAge:
 		return fmt.Errorf("%s logged in too long ago", c.PreferredUsername)
-	case uri != "" && yubikeyURI.FindStringSubmatch(uri)[1] != c.Subject:
-		return fmt.Errorf("%s is not assigned to %s", uri, c.PreferredUsername)
+	case uri != "" && certificateURI.FindStringSubmatch(uri)[1] != c.Subject:
+		return fmt.Errorf("%s does not belong to %s", uri, c.PreferredUsername)
 	}
 	return nil
 }
@@ -289,7 +299,7 @@ func (m *Auth) logout(w http.ResponseWriter, r *http.Request, id string) error {
 }
 
 func (m *Auth) deny(r *http.Request, status int, err error) error {
-	m.log.Warn("denied", zap.String("host", r.Host), zap.String("path", r.URL.Path), zap.Error(err))
+	m.log.Warn("request denied", zap.String("host", r.Host), zap.String("path", original(r).Path), zap.Error(err))
 	return caddyhttp.Error(status, err)
 }
 

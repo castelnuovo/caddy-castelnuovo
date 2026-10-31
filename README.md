@@ -28,7 +28,7 @@ xcaddy build --with github.com/castelnuovo/caddy-castelnuovo
 
 ## castelnuovo_auth
 
-Protects a site with a login at `https://id.castelnuovo.eu`. Without `yubikey off`, the site also needs a YubiKey client certificate.
+Protects a site with a login at `https://id.castelnuovo.eu`. Without `client_certificate off`, the site also needs a client certificate.
 
 ```caddyfile
 {
@@ -40,7 +40,7 @@ example.castelnuovo.eu {
  castelnuovo_auth {
   client_id {env.CLIENT_ID}
   client_secret {env.CLIENT_SECRET}
-  yubikey off
+  client_certificate off
  }
 
  reverse_proxy app:80

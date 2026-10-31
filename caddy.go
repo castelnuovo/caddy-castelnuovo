@@ -20,9 +20,9 @@ func init() {
 var stores = caddy.NewUsagePool()
 
 type Auth struct {
-	ClientID       string `json:"client_id"`
-	ClientSecret   string `json:"client_secret"`
-	DisableYubikey bool   `json:"disable_yubikey,omitempty"`
+	ClientID                 string `json:"client_id"`
+	ClientSecret             string `json:"client_secret"`
+	DisableClientCertificate bool   `json:"disable_client_certificate,omitempty"`
 
 	storeKey string
 	store    *store
@@ -42,8 +42,11 @@ func (m *Auth) Provision(ctx caddy.Context) error {
 	repl := caddy.NewReplacer()
 	clientID := repl.ReplaceAll(m.ClientID, "")
 	secret := repl.ReplaceAll(m.ClientSecret, "")
-	if clientID == "" || secret == "" {
-		return errors.New("client_id and client_secret are required")
+	switch {
+	case clientID == "":
+		return errors.New("client_id is empty")
+	case secret == "":
+		return errors.New("client_secret is empty")
 	}
 
 	st, _, err := stores.LoadOrNew(clientID, func() (caddy.Destructor, error) { return newStore(), nil })
@@ -78,14 +81,14 @@ func (m *Auth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if !d.AllArgs(&m.ClientSecret) {
 				return d.ArgErr()
 			}
-		case "yubikey":
+		case "client_certificate":
 			var value string
 			if !d.AllArgs(&value) || value != "off" {
-				return d.Err("yubikey only accepts off")
+				return d.Err("client_certificate only accepts 'off'")
 			}
-			m.DisableYubikey = true
+			m.DisableClientCertificate = true
 		default:
-			return d.Errf("unknown subdirective %q", d.Val())
+			return d.Errf("unrecognized subdirective '%s'", d.Val())
 		}
 	}
 	return nil

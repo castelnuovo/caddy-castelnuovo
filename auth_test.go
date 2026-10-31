@@ -17,11 +17,11 @@ import (
 )
 
 const (
-	sub          = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-	yubikey      = "spiffe://castelnuovo.eu/yubikey/87654321/owner/" + sub
-	otherYubikey = "spiffe://castelnuovo.eu/yubikey/12345678/owner/11111111-2222-3333-4444-555555555555"
-	machine      = "spiffe://castelnuovo.eu/client/backup"
-	host         = "app.castelnuovo.eu"
+	sub       = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	cert      = "spiffe://castelnuovo.eu/yubikey/87654321/owner/" + sub
+	otherCert = "spiffe://castelnuovo.eu/yubikey/12345678/owner/11111111-2222-3333-4444-555555555555"
+	machine   = "spiffe://castelnuovo.eu/client/backup"
+	host      = "app.castelnuovo.eu"
 )
 
 type fakePocketID struct {
@@ -122,18 +122,18 @@ func logIn(t *testing.T, s *Auth, uri string) *http.Response {
 func TestLogin(t *testing.T) {
 	s, _ := newTest()
 
-	resp := get(s, "/page", yubikey)
+	resp := get(s, "/page", cert)
 	if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/.castelnuovo/login?rd=%2Fpage" {
 		t.Fatalf("without session: %d %s", resp.StatusCode, resp.Header.Get("Location"))
 	}
 
-	resp = logIn(t, s, yubikey)
+	resp = logIn(t, s, cert)
 	session := cookie(resp, sessionCookie)
 	if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/page" || session == nil {
 		t.Fatalf("callback: %d %s", resp.StatusCode, resp.Header.Get("Location"))
 	}
 
-	resp = get(s, "/page", yubikey, session, &http.Cookie{Name: "app", Value: "kept"})
+	resp = get(s, "/page", cert, session, &http.Cookie{Name: "app", Value: "kept"})
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Auth-User") != "luca" || resp.Header.Get("X-Auth-Sub") != sub || resp.Header.Get("X-Auth-Name") != "Luca Castelnuovo" {
 		t.Fatalf("with session: %d %v", resp.StatusCode, resp.Header)
 	}
@@ -144,8 +144,8 @@ func TestLogin(t *testing.T) {
 
 func TestLoginRejects(t *testing.T) {
 	s, _ := newTest()
-	if resp := logIn(t, s, otherYubikey); resp.StatusCode != http.StatusForbidden || cookie(resp, sessionCookie) != nil {
-		t.Fatalf("YubiKey of another user: %d", resp.StatusCode)
+	if resp := logIn(t, s, otherCert); resp.StatusCode != http.StatusForbidden || cookie(resp, sessionCookie) != nil {
+		t.Fatalf("certificate of another user: %d", resp.StatusCode)
 	}
 
 	tests := map[string]func(*claims){
@@ -158,7 +158,7 @@ func TestLoginRejects(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s, idp := newTest()
 			change(&idp.claims)
-			if resp := logIn(t, s, yubikey); resp.StatusCode != http.StatusForbidden || cookie(resp, sessionCookie) != nil {
+			if resp := logIn(t, s, cert); resp.StatusCode != http.StatusForbidden || cookie(resp, sessionCookie) != nil {
 				t.Fatalf("status %d", resp.StatusCode)
 			}
 		})
@@ -167,48 +167,48 @@ func TestLoginRejects(t *testing.T) {
 
 func TestCallbackNeedsItsOwnLogin(t *testing.T) {
 	s, _ := newTest()
-	resp := get(s, "/.castelnuovo/login", yubikey)
+	resp := get(s, "/.castelnuovo/login", cert)
 	location, _ := url.Parse(resp.Header.Get("Location"))
 	callback := "/.castelnuovo/callback?code=c&state=" + location.Query().Get("state")
 	login := cookie(resp, loginCookie)
 
-	if resp := get(s, callback, yubikey); resp.StatusCode != http.StatusBadRequest {
+	if resp := get(s, callback, cert); resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("without login cookie: %d", resp.StatusCode)
 	}
-	if resp := get(s, "/.castelnuovo/callback?code=c&state=other", yubikey, login); resp.StatusCode != http.StatusBadRequest {
+	if resp := get(s, "/.castelnuovo/callback?code=c&state=other", cert, login); resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("with another state: %d", resp.StatusCode)
 	}
-	if resp := get(s, callback, yubikey, &http.Cookie{Name: loginCookie, Value: "forged"}); resp.StatusCode != http.StatusBadRequest {
+	if resp := get(s, callback, cert, &http.Cookie{Name: loginCookie, Value: "forged"}); resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("with a forged login cookie: %d", resp.StatusCode)
 	}
-	if resp := get(s, callback, otherYubikey, login); resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("with another YubiKey: %d", resp.StatusCode)
+	if resp := get(s, callback, otherCert, login); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("with another certificate: %d", resp.StatusCode)
 	}
 
-	resp = get(s, callback, yubikey, login)
+	resp = get(s, callback, cert, login)
 	if deleted := cookie(resp, loginCookie); resp.StatusCode != http.StatusFound || deleted == nil || deleted.MaxAge >= 0 {
 		t.Fatalf("callback keeps the login cookie: %d", resp.StatusCode)
 	}
-	if resp := get(s, callback, yubikey); resp.StatusCode != http.StatusBadRequest {
+	if resp := get(s, callback, cert); resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("used twice: %d", resp.StatusCode)
 	}
 }
 
 func TestVerifyRejects(t *testing.T) {
 	s, _ := newTest()
-	session := cookie(logIn(t, s, yubikey), sessionCookie)
+	session := cookie(logIn(t, s, cert), sessionCookie)
 
 	tests := map[string]struct {
 		uri    string
 		cookie *http.Cookie
 		status int
 	}{
-		"no certificate":        {"", session, http.StatusForbidden},
-		"machine certificate":   {machine, session, http.StatusForbidden},
-		"YubiKey without owner": {"spiffe://castelnuovo.eu/yubikey/87654321", session, http.StatusForbidden},
-		"old URI format":        {"https://pki.castelnuovo.eu#yubikey-87654321@" + sub, session, http.StatusForbidden},
-		"another YubiKey":       {otherYubikey, session, http.StatusFound},
-		"forged cookie":         {yubikey, &http.Cookie{Name: sessionCookie, Value: "forged"}, http.StatusFound},
+		"no certificate":            {"", session, http.StatusForbidden},
+		"machine certificate":       {machine, session, http.StatusForbidden},
+		"certificate without owner": {"spiffe://castelnuovo.eu/yubikey/87654321", session, http.StatusForbidden},
+		"old URI format":            {"https://pki.castelnuovo.eu#yubikey-87654321@" + sub, session, http.StatusForbidden},
+		"another certificate":       {otherCert, session, http.StatusFound},
+		"forged cookie":             {cert, &http.Cookie{Name: sessionCookie, Value: "forged"}, http.StatusFound},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -233,13 +233,13 @@ func TestRefreshEndsSession(t *testing.T) {
 	for name, change := range tests {
 		t.Run(name, func(t *testing.T) {
 			s, idp := newTest()
-			session := cookie(logIn(t, s, yubikey), sessionCookie)
+			session := cookie(logIn(t, s, cert), sessionCookie)
 
 			change(idp)
 			later := time.Now().Add(refreshInterval + time.Minute)
 			s.now = func() time.Time { return later }
 
-			if resp := get(s, "/page", yubikey, session); resp.StatusCode != http.StatusFound {
+			if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusFound {
 				t.Fatalf("status %d", resp.StatusCode)
 			}
 		})
@@ -248,26 +248,26 @@ func TestRefreshEndsSession(t *testing.T) {
 
 func TestCancelledRequestKeepsSession(t *testing.T) {
 	s, _ := newTest()
-	session := cookie(logIn(t, s, yubikey), sessionCookie)
+	session := cookie(logIn(t, s, cert), sessionCookie)
 
 	later := time.Now().Add(refreshInterval + time.Minute)
 	s.now = func() time.Time { return later }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	serve(s, request(http.MethodGet, "/page", yubikey, session).WithContext(ctx))
+	serve(s, request(http.MethodGet, "/page", cert, session).WithContext(ctx))
 
-	if resp := get(s, "/page", yubikey, session); resp.StatusCode != http.StatusOK {
+	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusOK {
 		t.Fatalf("after a cancelled request: %d", resp.StatusCode)
 	}
 }
 
 func TestRefreshLocksOnlyItsSession(t *testing.T) {
 	s, idp := newTest()
-	refreshing := cookie(logIn(t, s, yubikey), sessionCookie)
+	refreshing := cookie(logIn(t, s, cert), sessionCookie)
 	later := time.Now().Add(refreshInterval + time.Minute)
 	s.now = func() time.Time { return later }
-	other := cookie(logIn(t, s, yubikey), sessionCookie)
+	other := cookie(logIn(t, s, cert), sessionCookie)
 
 	entered, release := make(chan struct{}, 5), make(chan struct{})
 	idp.onRefresh = func() {
@@ -276,7 +276,7 @@ func TestRefreshLocksOnlyItsSession(t *testing.T) {
 	}
 	statuses := make(chan int)
 	for range 5 {
-		go func() { statuses <- get(s, "/page", yubikey, refreshing).StatusCode }()
+		go func() { statuses <- get(s, "/page", cert, refreshing).StatusCode }()
 	}
 
 	timeout := time.After(5 * time.Second)
@@ -287,7 +287,7 @@ func TestRefreshLocksOnlyItsSession(t *testing.T) {
 	}
 
 	done := make(chan int)
-	go func() { done <- get(s, "/page", yubikey, other).StatusCode }()
+	go func() { done <- get(s, "/page", cert, other).StatusCode }()
 	select {
 	case status := <-done:
 		if status != http.StatusOK {
@@ -310,13 +310,13 @@ func TestRefreshLocksOnlyItsSession(t *testing.T) {
 
 func TestLogout(t *testing.T) {
 	s, idp := newTest()
-	session := cookie(logIn(t, s, yubikey), sessionCookie)
+	session := cookie(logIn(t, s, cert), sessionCookie)
 
-	if resp := get(s, "/.castelnuovo/logout", yubikey, session); resp.StatusCode != http.StatusMethodNotAllowed {
+	if resp := get(s, "/.castelnuovo/logout", cert, session); resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("GET: %d", resp.StatusCode)
 	}
 
-	req := request(http.MethodPost, "/.castelnuovo/logout", yubikey)
+	req := request(http.MethodPost, "/.castelnuovo/logout", cert)
 	req.Header.Set("Sec-Fetch-Site", "cross-site")
 	if resp := serve(s, req); resp.StatusCode != http.StatusForbidden || cookie(resp, sessionCookie) != nil {
 		t.Fatalf("cross-site POST: %d", resp.StatusCode)
@@ -324,28 +324,28 @@ func TestLogout(t *testing.T) {
 
 	later := time.Now().Add(refreshInterval + time.Minute)
 	s.now = func() time.Time { return later }
-	if resp := get(s, "/page", yubikey, session); resp.StatusCode != http.StatusOK {
+	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusOK {
 		t.Fatalf("refresh: %d", resp.StatusCode)
 	}
 
-	resp := serve(s, request(http.MethodPost, "/.castelnuovo/logout", yubikey, session))
+	resp := serve(s, request(http.MethodPost, "/.castelnuovo/logout", cert, session))
 	if cleared := cookie(resp, sessionCookie); resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != idp.logoutURL("refreshed-id-token", "https://"+host+"/") || cleared == nil || cleared.MaxAge >= 0 {
 		t.Fatalf("POST: %d %s", resp.StatusCode, resp.Header.Get("Location"))
 	}
 
-	if resp := get(s, "/page", yubikey, session); resp.StatusCode != http.StatusFound {
+	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusFound {
 		t.Fatalf("after logout: %d", resp.StatusCode)
 	}
-	if resp := serve(s, request(http.MethodPost, "/.castelnuovo/logout", yubikey, session)); resp.Header.Get("Location") != idp.logoutURL("", "https://"+host+"/") {
+	if resp := serve(s, request(http.MethodPost, "/.castelnuovo/logout", cert, session)); resp.Header.Get("Location") != idp.logoutURL("", "https://"+host+"/") {
 		t.Fatalf("POST without a session: %s", resp.Header.Get("Location"))
 	}
 }
 
 func TestRemovesSpoofedHeaders(t *testing.T) {
 	s, _ := newTest()
-	session := cookie(logIn(t, s, yubikey), sessionCookie)
+	session := cookie(logIn(t, s, cert), sessionCookie)
 
-	req := request(http.MethodGet, "/page", yubikey, session)
+	req := request(http.MethodGet, "/page", cert, session)
 	req.Header.Set("X_Auth_User", "spoofed")
 	if resp := serve(s, req); resp.StatusCode != http.StatusOK || resp.Header.Get("X-Auth-User") != "luca" || resp.Header.Get("X_Auth_User") != "" {
 		t.Fatalf("app received %v", resp.Header)
@@ -360,12 +360,12 @@ func TestRemovesSpoofedHeaders(t *testing.T) {
 
 func TestSessionExpires(t *testing.T) {
 	s, _ := newTest()
-	session := cookie(logIn(t, s, yubikey), sessionCookie)
+	session := cookie(logIn(t, s, cert), sessionCookie)
 
 	later := time.Now().Add(sessionLifetime + time.Minute)
 	s.now = func() time.Time { return later }
 
-	if resp := get(s, "/page", yubikey, session); resp.StatusCode != http.StatusFound {
+	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusFound {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
 }
@@ -378,22 +378,22 @@ func TestNoOpenRedirect(t *testing.T) {
 	}
 
 	s, _ := newTest()
-	resp := get(s, "/.castelnuovo/login?rd="+url.QueryEscape("/\t/evil.example"), yubikey)
+	resp := get(s, "/.castelnuovo/login?rd="+url.QueryEscape("/\t/evil.example"), cert)
 	location, _ := url.Parse(resp.Header.Get("Location"))
-	resp = get(s, "/.castelnuovo/callback?code=c&state="+location.Query().Get("state"), yubikey, cookie(resp, loginCookie))
+	resp = get(s, "/.castelnuovo/callback?code=c&state="+location.Query().Get("state"), cert, cookie(resp, loginCookie))
 	if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/" {
 		t.Fatalf("callback: %d %q", resp.StatusCode, resp.Header.Get("Location"))
 	}
 }
 
-func TestWithoutYubikey(t *testing.T) {
+func TestWithoutCertificate(t *testing.T) {
 	s, _ := newTest()
-	s.DisableYubikey = true
+	s.DisableClientCertificate = true
 
 	resp := logIn(t, s, "")
 	session := cookie(resp, sessionCookie)
 	if resp.StatusCode != http.StatusFound || session == nil {
-		t.Fatalf("login without a YubiKey: %d", resp.StatusCode)
+		t.Fatalf("login without a certificate: %d", resp.StatusCode)
 	}
 
 	later := time.Now().Add(refreshInterval + time.Minute)
@@ -402,8 +402,8 @@ func TestWithoutYubikey(t *testing.T) {
 		t.Fatalf("verify after refresh: %d", resp.StatusCode)
 	}
 
-	s.DisableYubikey = false
-	if resp := get(s, "/page", yubikey, session); resp.StatusCode != http.StatusFound {
-		t.Fatalf("site that requires a YubiKey: %d", resp.StatusCode)
+	s.DisableClientCertificate = false
+	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusFound {
+		t.Fatalf("site that requires a certificate: %d", resp.StatusCode)
 	}
 }

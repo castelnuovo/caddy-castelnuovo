@@ -27,8 +27,6 @@ var (
 	errLoginTooOld = errors.New("login is too old")
 )
 
-// pendingLogin is a login that was sent to the identity provider, kept in a cookie until it
-// comes back to the callback.
 type pendingLogin struct {
 	State    string `json:"state"`
 	Nonce    string `json:"nonce"`
@@ -37,7 +35,6 @@ type pendingLogin struct {
 	Reauth   bool   `json:"reauth,omitempty"`
 }
 
-// login sends the user to the identity provider. After logging in, they return to redirect.
 func (m *Auth) login(req *request, redirect string, reauth bool) {
 	dropPendingLogins(req)
 	l := pendingLogin{
@@ -51,8 +48,6 @@ func (m *Auth) login(req *request, redirect string, reauth bool) {
 	http.Redirect(req.w, req.r, m.idp.authURL(callbackURL(req.r.Host), l.State, l.Nonce, l.Verifier, reauth), http.StatusFound)
 }
 
-// dropPendingLogins deletes the login cookies once there are maxPendingLogins of them, so
-// abandoned logins can't pile up.
 func dropPendingLogins(req *request) {
 	if len(req.logins) < maxPendingLogins {
 		return
@@ -62,7 +57,6 @@ func dropPendingLogins(req *request) {
 	}
 }
 
-// callback finishes a login that the identity provider sent back.
 func (m *Auth) callback(req *request) error {
 	query := original(req.r).Query()
 	state := query.Get("state")
@@ -100,8 +94,6 @@ func (m *Auth) callback(req *request) error {
 	return nil
 }
 
-// callbackWithoutLogin handles a callback whose login cookie is gone. That happens when the user
-// goes back to the callback after logging in, so a user with a session is sent home.
 func (m *Auth) callbackWithoutLogin(req *request) error {
 	if c, err := m.verify(req); c != nil && err == nil {
 		redirectLocal(req, "/")
@@ -110,7 +102,6 @@ func (m *Auth) callbackWithoutLogin(req *request) error {
 	return deny(http.StatusBadRequest, errors.New("login cookie is missing"))
 }
 
-// takeLogin deletes the login cookie for state and returns the login it holds.
 func takeLogin(req *request, state string) (pendingLogin, error) {
 	value := req.logins[state]
 	delete(req.logins, state)
@@ -139,7 +130,6 @@ func (m *Auth) checkLogin(c *claims, nonce, uri string) error {
 	return nil
 }
 
-// logout ends the session here and the login at the identity provider.
 func (m *Auth) logout(req *request) error {
 	if err := crossOrigin.Check(req.r); err != nil {
 		return deny(http.StatusForbidden, err)
@@ -149,8 +139,6 @@ func (m *Auth) logout(req *request) error {
 	return nil
 }
 
-// cookie returns the value of l's login cookie. It leaves out the redirect when that would make
-// the cookie too big for browsers to keep.
 func (l pendingLogin) cookie() string {
 	value := l.encode()
 	if len(loginCookie)+len(l.State)+len(value) > maxCookieSize {
@@ -177,7 +165,6 @@ func decodeLogin(value string) (pendingLogin, error) {
 	return l, err
 }
 
-// redirectLocal sends the user to p, or to the home page when p is not a path on this site.
 func redirectLocal(req *request, p string) {
 	if !isLocalPath(p) {
 		p = "/"
@@ -185,7 +172,6 @@ func redirectLocal(req *request, p string) {
 	http.Redirect(req.w, req.r, p, http.StatusFound)
 }
 
-// isLocalPath reports whether p is a path on this site that is safe to redirect to.
 func isLocalPath(p string) bool {
 	return strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "//") && !strings.Contains(p, `\`) && !strings.ContainsFunc(p, unicode.IsControl)
 }

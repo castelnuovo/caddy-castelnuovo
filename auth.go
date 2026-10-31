@@ -20,17 +20,15 @@ const (
 
 var yubikeyURI = regexp.MustCompile(`^spiffe://castelnuovo\.eu/yubikey/[0-9]+/owner/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
 
-// request holds what the handler knows about the request it is serving.
 type request struct {
 	w         http.ResponseWriter
 	r         *http.Request
-	uri       string            // URI of the client certificate, empty when certificates are off
-	sessionID string            // value of the session cookie
-	logins    map[string]string // login cookies by state
+	uri       string
+	sessionID string
+	logins    map[string]string
 	log       *zap.Logger
 }
 
-// denial is an error that ServeHTTP logs before turning it into a Caddy error.
 type denial struct {
 	status int
 	err    error
@@ -121,7 +119,6 @@ func clientCertificate(r *http.Request) string {
 	return r.TLS.VerifiedChains[0][0].URIs[0].String()
 }
 
-// certificateOwner returns the user ID in a YubiKey certificate URI, or "" for any other URI.
 func certificateOwner(uri string) string {
 	if match := yubikeyURI.FindStringSubmatch(uri); match != nil {
 		return match[1]
@@ -129,8 +126,6 @@ func certificateOwner(uri string) string {
 	return ""
 }
 
-// challenge sends a page load without a session to the login. Other requests can't follow
-// that redirect, so they get a 401.
 func challenge(req *request) error {
 	if !isPageLoad(req.r) {
 		return caddyhttp.Error(http.StatusUnauthorized, errors.New("login required"))
@@ -149,8 +144,6 @@ func methodNotAllowed(w http.ResponseWriter, path, allow string) error {
 	return caddyhttp.Error(http.StatusMethodNotAllowed, fmt.Errorf("%s only accepts %s", path, allow))
 }
 
-// removeAuthHeaders removes every header that could pass for one of ours, including spellings
-// with underscores that CGI and some app servers treat as dashes.
 func removeAuthHeaders(r *http.Request) {
 	for name := range r.Header {
 		if strings.HasPrefix(strings.ToUpper(strings.ReplaceAll(name, "_", "-")), "X-AUTH-") {
@@ -167,7 +160,6 @@ func setAuthHeaders(r *http.Request, c *claims) {
 	r.Header.Set("X-Auth-Groups", strings.Join(c.Groups, ","))
 }
 
-// original returns the URL the client asked for, before Caddy rewrote it.
 func original(r *http.Request) *url.URL {
 	if orig, ok := r.Context().Value(caddyhttp.OriginalRequestCtxKey).(http.Request); ok {
 		return orig.URL

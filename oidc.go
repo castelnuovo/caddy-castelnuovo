@@ -28,7 +28,6 @@ type claims struct {
 	idToken           string
 }
 
-// pocketID is the identity provider, so tests can replace it.
 type pocketID interface {
 	authURL(redirectURL, state, nonce, verifier string, reauth bool) string
 	exchange(ctx context.Context, redirectURL, code, verifier string) (*claims, string, error)
@@ -100,8 +99,6 @@ func (o *oidcClient) refresh(ctx context.Context, refreshToken string) (*claims,
 	return o.claims(ctx, token)
 }
 
-// tokenError marks a failed token request as errUnavailable, unless the identity provider
-// answered it and refused.
 func tokenError(err error) error {
 	e, ok := errors.AsType[*oauth2.RetrieveError](err)
 	if !ok || e.Response != nil && (e.Response.StatusCode >= 500 || e.Response.StatusCode == http.StatusTooManyRequests) {
@@ -121,7 +118,6 @@ func (o *oidcClient) logoutURL(idToken, redirectURL string) string {
 	return o.issuer + "/api/oidc/end-session?" + query.Encode()
 }
 
-// claims verifies the ID token in a token response and returns its claims and the refresh token.
 func (o *oidcClient) claims(ctx context.Context, token *oauth2.Token) (*claims, string, error) {
 	raw, ok := token.Extra("id_token").(string)
 	if !ok {

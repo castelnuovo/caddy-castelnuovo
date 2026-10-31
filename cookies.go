@@ -12,8 +12,6 @@ const (
 	maxCookieSize = 4096
 )
 
-// removeCookies removes every cookie whose name starts with sessionCookie, and returns the
-// session cookie and the login cookies by state. The app's own cookies stay exactly as sent.
 func removeCookies(r *http.Request) (sessionID string, logins map[string]string) {
 	logins = map[string]string{}
 	var kept []string

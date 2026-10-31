@@ -66,7 +66,6 @@ func (s *store) remove(id string) {
 	delete(s.sessions, id)
 }
 
-// startSession stores a new session for c and gives the browser its cookie.
 func (m *Auth) startSession(req *request, c *claims, refreshToken string) {
 	now := m.now()
 	id := m.store.add(&session{
@@ -82,7 +81,6 @@ func (m *Auth) startSession(req *request, c *claims, refreshToken string) {
 	req.log.Info("user logged in", zap.String("sub", c.Subject))
 }
 
-// endSession removes the request's session and its cookie, and returns its ID token.
 func (m *Auth) endSession(req *request) string {
 	setCookie(req.w, sessionCookie, "", -time.Second)
 	sess := m.store.get(req.sessionID)
@@ -97,7 +95,6 @@ func (m *Auth) endSession(req *request) string {
 	return sess.claims.idToken
 }
 
-// verify returns the claims of the request's session, or nil when it has no usable session.
 func (m *Auth) verify(req *request) (*claims, error) {
 	sess := m.findSession(req)
 	if sess == nil {
@@ -107,7 +104,7 @@ func (m *Auth) verify(req *request) (*claims, error) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	if m.store.get(req.sessionID) != sess {
-		return nil, nil // the session ended while this request waited for the lock
+		return nil, nil
 	}
 	err := m.refresh(context.WithoutCancel(req.r.Context()), sess)
 	switch {
@@ -121,8 +118,6 @@ func (m *Auth) verify(req *request) (*claims, error) {
 	return sess.claims, nil
 }
 
-// findSession returns the request's session if it has not expired and was started on this
-// host with this client certificate.
 func (m *Auth) findSession(req *request) *session {
 	sess := m.store.get(req.sessionID)
 	switch {
@@ -135,7 +130,6 @@ func (m *Auth) findSession(req *request) *session {
 	return sess
 }
 
-// refresh renews the tokens of sess once they are refreshInterval old. The caller holds sess.mu.
 func (m *Auth) refresh(ctx context.Context, sess *session) error {
 	now := m.now()
 	switch {
@@ -158,8 +152,6 @@ func (m *Auth) refresh(ctx context.Context, sess *session) error {
 	return nil
 }
 
-// unavailable records a refresh that failed because the identity provider could not be
-// reached. It keeps the session until refreshes have failed for maxOutage.
 func (s *session) unavailable(now time.Time, err error) error {
 	if s.failingSince.IsZero() {
 		s.failingSince = now

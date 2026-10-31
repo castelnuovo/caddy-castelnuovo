@@ -66,7 +66,7 @@ func (m *Auth) newRequest(w http.ResponseWriter, r *http.Request) *request {
 	if clientIP, _ := caddyhttp.GetVar(r.Context(), caddyhttp.ClientIPVarKey).(string); clientIP != "" {
 		fields = append(fields, zap.String("client_ip", clientIP))
 	}
-	req.log = m.log.With(fields...)
+	req.log = m.log.WithLazy(fields...)
 	return req
 }
 

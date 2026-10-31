@@ -62,7 +62,11 @@ func TestUnavailableIdentityProviderKeepsSession(t *testing.T) {
 	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("while unavailable again: %d", resp.StatusCode)
 	}
-	now = now.Add(maxOutage)
+	now = now.Add(maxOutage / 2)
+	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("halfway through a long outage: %d", resp.StatusCode)
+	}
+	now = now.Add(maxOutage / 2)
 	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusFound {
 		t.Fatalf("after a long outage: %d", resp.StatusCode)
 	}
@@ -212,5 +216,25 @@ func TestSessionBinding(t *testing.T) {
 	}
 	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusOK {
 		t.Fatalf("own host and certificate: %d", resp.StatusCode)
+	}
+}
+
+func TestSeparateOutagesKeepSession(t *testing.T) {
+	s, idp := newTest()
+	session := cookie(logIn(t, s, cert), sessionCookie)
+
+	idp.refreshErr = fmt.Errorf("%w: connection refused", errUnavailable)
+	now := time.Now().Add(refreshInterval + time.Minute)
+	s.now = func() time.Time { return now }
+	for range 2 {
+		if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("outage: %d", resp.StatusCode)
+		}
+		now = now.Add(maxOutage + time.Minute)
+	}
+
+	idp.refreshErr = nil
+	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusOK {
+		t.Fatalf("after the outages: %d", resp.StatusCode)
 	}
 }

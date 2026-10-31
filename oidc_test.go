@@ -28,11 +28,12 @@ type tokenRequest struct {
 
 type testIdP struct {
 	*httptest.Server
-	key    *rsa.PrivateKey
-	claims map[string]any
-	status int
-	omit   string
-	tokens chan tokenRequest
+	key        *rsa.PrivateKey
+	claims     map[string]any
+	status     int
+	jwksStatus int
+	omit       string
+	tokens     chan tokenRequest
 }
 
 func newIdP(t *testing.T) *testIdP {
@@ -43,6 +44,10 @@ func newIdP(t *testing.T) *testIdP {
 	p := &testIdP{key: key, tokens: make(chan tokenRequest, 10)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/jwks.json", func(w http.ResponseWriter, r *http.Request) {
+		if p.jwksStatus != 0 {
+			w.WriteHeader(p.jwksStatus)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
 			"kty": "RSA",
 			"kid": "test",
@@ -159,6 +164,7 @@ func TestOIDCExchangeFails(t *testing.T) {
 		"another audience": {func(p *testIdP) { p.claims["aud"] = "other" }, 1, false},
 		"expired ID token": {func(p *testIdP) { p.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, 1, false},
 		"malformed claims": {func(p *testIdP) { p.claims["auth_time"] = "yesterday" }, 1, false},
+		"keys unavailable": {func(p *testIdP) { p.jwksStatus = http.StatusServiceUnavailable }, 1, true},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {

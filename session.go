@@ -148,17 +148,17 @@ func (m *Auth) refresh(ctx context.Context, sess *session) error {
 	case c.Subject != sess.sub:
 		return errors.New("refresh returned another user")
 	}
-	sess.claims, sess.refreshToken, sess.refreshedAt, sess.failingSince = c, refreshToken, now, time.Time{}
+	sess.claims, sess.refreshToken, sess.refreshedAt, sess.failedAt = c, refreshToken, now, time.Time{}
 	return nil
 }
 
 func (s *session) unavailable(now time.Time, err error) error {
-	if s.failingSince.IsZero() {
+	if now.Sub(s.failedAt) >= maxOutage {
 		s.failingSince = now
 	}
+	s.failedAt = now
 	if now.Sub(s.failingSince) >= maxOutage {
 		return fmt.Errorf("refresh kept failing for %s: %v", maxOutage, err)
 	}
-	s.failedAt = now
 	return err
 }

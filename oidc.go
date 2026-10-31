@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
@@ -124,6 +125,9 @@ func (o *oidcClient) claims(ctx context.Context, token *oauth2.Token) (*claims, 
 		return nil, "", errors.New("token response has no id_token")
 	}
 	idToken, err := o.verifier.Verify(ctx, raw)
+	if err != nil && strings.Contains(err.Error(), "fetching keys") {
+		return nil, "", fmt.Errorf("%w: %w", errUnavailable, err)
+	}
 	if err != nil {
 		return nil, "", err
 	}

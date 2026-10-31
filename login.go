@@ -95,7 +95,11 @@ func (m *Auth) callback(req *request) error {
 }
 
 func (m *Auth) callbackWithoutLogin(req *request) error {
-	if c, err := m.verify(req); c != nil && err == nil {
+	c, err := m.verify(req)
+	switch {
+	case err != nil:
+		return err
+	case c != nil:
 		redirectLocal(req, "/")
 		return nil
 	}

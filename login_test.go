@@ -2,6 +2,7 @@ package castelnuovo
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -181,5 +182,17 @@ func TestLogout(t *testing.T) {
 	}
 	if resp := serve(s, httpRequest(http.MethodPost, "/.castelnuovo/logout", cert, session)); resp.Header.Get("Location") != idp.logoutURL("", "https://"+host+"/") {
 		t.Fatalf("POST without a session: %s", resp.Header.Get("Location"))
+	}
+}
+
+func TestCallbackWithoutLoginDuringOutage(t *testing.T) {
+	s, idp := newTest()
+	session := cookie(logIn(t, s, cert), sessionCookie)
+
+	idp.refreshErr = fmt.Errorf("%w: connection refused", errUnavailable)
+	later := time.Now().Add(refreshInterval + time.Minute)
+	s.now = func() time.Time { return later }
+	if resp := get(s, "/.castelnuovo/callback?code=c&state=gone", cert, session); resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status %d", resp.StatusCode)
 	}
 }

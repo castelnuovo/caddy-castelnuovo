@@ -12,12 +12,12 @@ import (
 func TestRemoveCookies(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r.Header.Add("Cookie", `prefs={"theme":"dark"}; __Host-castelnuovo=session-id; name=café; path=a\b`)
-	r.Header.Add("Cookie", loginCookie+"STATE=pending; spaced=a b; __Host-castelnuovo-login=old")
+	r.Header.Add("Cookie", loginCookie+"STATE=pending; spaced=a b; __Host-castelnuovo-lang=nl")
 	sessionID, logins := removeCookies(r)
 	if sessionID != "session-id" || !maps.Equal(logins, map[string]string{"STATE": "pending"}) {
 		t.Fatalf("session %q, logins %v", sessionID, logins)
 	}
-	if want := []string{`prefs={"theme":"dark"}; name=café; path=a\b; spaced=a b`}; !slices.Equal(r.Header.Values("Cookie"), want) {
+	if want := []string{`prefs={"theme":"dark"}; name=café; path=a\b; spaced=a b; __Host-castelnuovo-lang=nl`}; !slices.Equal(r.Header.Values("Cookie"), want) {
 		t.Fatalf("app receives %q", r.Header.Values("Cookie"))
 	}
 

@@ -21,14 +21,12 @@ func removeCookies(r *http.Request) (sessionID string, logins map[string]string)
 			name, value, _ := strings.Cut(part, "=")
 			name, value = strings.TrimSpace(name), strings.TrimSpace(value)
 			switch {
-			case !strings.HasPrefix(name, sessionCookie):
-				if part != "" {
-					kept = append(kept, part)
-				}
 			case name == sessionCookie:
 				sessionID = value
 			case strings.HasPrefix(name, loginCookie):
 				logins[strings.TrimPrefix(name, loginCookie)] = value
+			case part != "":
+				kept = append(kept, part)
 			}
 		}
 	}

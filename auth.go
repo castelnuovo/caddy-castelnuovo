@@ -122,7 +122,7 @@ func (m *Auth) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.
 
 	uri, err := m.certificate(r)
 	if err != nil {
-		return m.deny(r, http.StatusForbidden, err)
+		return m.deny(r, http.StatusForbidden, err, "", uri)
 	}
 
 	switch path := original(r).Path; {
@@ -132,7 +132,7 @@ func (m *Auth) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.
 	case path == callbackPath && r.Method == http.MethodGet:
 		return m.callback(w, r, uri, login)
 	case path == logoutPath && r.Method == http.MethodPost:
-		return m.logout(w, r, sessionID)
+		return m.logout(w, r, uri, sessionID)
 	case path == loginPath || path == callbackPath:
 		return caddyhttp.Error(http.StatusMethodNotAllowed, fmt.Errorf("%s only accepts GET", path))
 	case path == logoutPath:
@@ -163,7 +163,7 @@ func (m *Auth) certificate(r *http.Request) (string, error) {
 	case uri == "":
 		return "", errors.New("a client certificate is required")
 	case !certificateURI.MatchString(uri):
-		return "", fmt.Errorf("%s is not an allowed client certificate", uri)
+		return uri, errors.New("client certificate is not allowed")
 	}
 	return uri, nil
 }
@@ -181,7 +181,7 @@ func (m *Auth) verify(r *http.Request, uri, id string) *claims {
 	}
 	if err := m.refresh(context.WithoutCancel(r.Context()), sess); err != nil {
 		m.store.remove(id)
-		m.log.Warn("session ended", zap.String("user", sess.claims.PreferredUsername), zap.String("host", r.Host), zap.Error(err))
+		m.log.Warn("session ended", append(logFields(r, sess.claims.Subject, uri), zap.Error(err))...)
 		return nil
 	}
 	return sess.claims
@@ -231,11 +231,11 @@ func (m *Auth) callback(w http.ResponseWriter, r *http.Request, uri, login strin
 	query := original(r).Query()
 	switch {
 	case login == "":
-		return m.deny(r, http.StatusBadRequest, errors.New("login cookie is missing"))
+		return m.deny(r, http.StatusBadRequest, errors.New("login cookie is missing"), "", uri)
 	case err != nil || l.State == "":
-		return m.deny(r, http.StatusBadRequest, errors.New("login cookie is invalid"))
+		return m.deny(r, http.StatusBadRequest, errors.New("login cookie is invalid"), "", uri)
 	case l.State != query.Get("state"):
-		return m.deny(r, http.StatusBadRequest, errors.New("state does not match the login cookie"))
+		return m.deny(r, http.StatusBadRequest, errors.New("state does not match the login cookie"), "", uri)
 	}
 	setCookie(w, loginCookie, "", -time.Second)
 
@@ -244,7 +244,11 @@ func (m *Auth) callback(w http.ResponseWriter, r *http.Request, uri, login strin
 		err = m.checkLogin(c, l.Nonce, uri)
 	}
 	if err != nil {
-		return m.deny(r, http.StatusForbidden, err)
+		var sub string
+		if c != nil {
+			sub = c.Subject
+		}
+		return m.deny(r, http.StatusForbidden, err, sub, uri)
 	}
 
 	now := m.now()
@@ -257,7 +261,7 @@ func (m *Auth) callback(w http.ResponseWriter, r *http.Request, uri, login strin
 		expiresAt:    now.Add(sessionLifetime),
 	}, now)
 
-	m.log.Info("user logged in", zap.String("user", c.PreferredUsername), zap.String("host", r.Host), zap.String("certificate", uri))
+	m.log.Info("user logged in", logFields(r, c.Subject, uri)...)
 	setCookie(w, sessionCookie, id, sessionLifetime)
 	if !isLocalPath(l.Redirect) {
 		l.Redirect = "/"
@@ -273,24 +277,25 @@ func (m *Auth) checkLogin(c *claims, nonce, uri string) error {
 	case c.Nonce != nonce:
 		return errors.New("ID token nonce does not match")
 	case !slices.Contains(c.AMR, "phr"):
-		return fmt.Errorf("%s did not log in with a passkey", c.PreferredUsername)
+		return errors.New("login did not use a passkey")
 	case m.now().Sub(time.Unix(c.AuthTime, 0)) > maxAuthAge:
-		return fmt.Errorf("%s logged in too long ago", c.PreferredUsername)
+		return errors.New("login is too old")
 	case uri != "" && certificateURI.FindStringSubmatch(uri)[1] != c.Subject:
-		return fmt.Errorf("%s does not belong to %s", uri, c.PreferredUsername)
+		return errors.New("client certificate belongs to another user")
 	}
 	return nil
 }
 
-func (m *Auth) logout(w http.ResponseWriter, r *http.Request, id string) error {
+func (m *Auth) logout(w http.ResponseWriter, r *http.Request, uri, id string) error {
 	if err := http.NewCrossOriginProtection().Check(r); err != nil {
-		return m.deny(r, http.StatusForbidden, err)
+		return m.deny(r, http.StatusForbidden, err, "", uri)
 	}
 	var idToken string
 	if sess := m.store.get(id); sess != nil {
 		m.store.remove(id)
 		sess.mu.Lock()
 		idToken = sess.claims.idToken
+		m.log.Info("user logged out", logFields(r, sess.claims.Subject, sess.uri)...)
 		sess.mu.Unlock()
 	}
 	setCookie(w, sessionCookie, "", -time.Second)
@@ -298,9 +303,22 @@ func (m *Auth) logout(w http.ResponseWriter, r *http.Request, id string) error {
 	return nil
 }
 
-func (m *Auth) deny(r *http.Request, status int, err error) error {
-	m.log.Warn("request denied", zap.String("host", r.Host), zap.String("path", original(r).Path), zap.Error(err))
+func (m *Auth) deny(r *http.Request, status int, err error, sub, uri string) error {
+	clientIP, _ := caddyhttp.GetVar(r.Context(), caddyhttp.ClientIPVarKey).(string)
+	m.log.Warn("request denied", append(logFields(r, sub, uri), zap.String("path", original(r).Path), zap.String("client_ip", clientIP), zap.Error(err))...)
 	return caddyhttp.Error(status, err)
+}
+
+func logFields(r *http.Request, sub, uri string) []zap.Field {
+	var fields []zap.Field
+	if sub != "" {
+		fields = append(fields, zap.String("sub", sub))
+	}
+	fields = append(fields, zap.String("host", r.Host))
+	if uri != "" {
+		fields = append(fields, zap.String("certificate", uri))
+	}
+	return fields
 }
 
 func original(r *http.Request) *url.URL {

@@ -56,8 +56,8 @@ secure.example.castelnuovo.eu {
  }
 
  castelnuovo_auth {
-  client_id {env.SECURE_CLIENT_ID}
-  client_secret {env.SECURE_CLIENT_SECRET}
+  client_id {env.CASTELNUOVO_CLIENT_ID}
+  client_secret {env.CASTELNUOVO_CLIENT_SECRET}
  }
 
  reverse_proxy app:80

@@ -16,12 +16,18 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+      - id: go
+        run: |
+          builder=$(sed -n 's/^FROM \([^ ]*\) AS build$/\1/p' Dockerfile)
+          version=$(docker run --rm --entrypoint go "$builder" env GOVERSION)
+          echo "version=${version#go}" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@v7.0.0
         with:
-          go-version: stable
+          go-version: ${{ steps.go.outputs.version }}
           cache: false
       - run: test -z "$(gofmt -l . | tee /dev/stderr)"
       - run: go vet ./...
+      - run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
       - run: go test -race ./...
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
@@ -51,6 +57,9 @@ jobs:
     needs: [test, build, verify]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: publish
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -71,6 +80,7 @@ jobs:
         shell: bash
         run: |
           digest=$(docker push "$IMAGE:$GITHUB_SHA" | sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p')
+          test -n "$digest" || { echo "::error::docker push did not report a digest"; exit 1; }
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - uses: actions/attest@v4.2.2
         with:
@@ -78,7 +88,12 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
       - run: |
-          docker push "$IMAGE:latest"
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)" = "$GITHUB_SHA" ]; then
+            docker push "$IMAGE:latest"
+          else
+            echo "::notice::$GITHUB_REF_NAME has moved on, so $GITHUB_SHA is not tagged latest"
+          fi
           echo "$IMAGE@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}

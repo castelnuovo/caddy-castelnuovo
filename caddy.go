@@ -2,6 +2,7 @@ package castelnuovo
 
 import (
 	"errors"
+	"net/http"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -55,7 +56,7 @@ func (m *Auth) Provision(ctx caddy.Context) error {
 	}
 	m.storeKey = clientID
 	m.store = st.(*store)
-	m.idp = newOIDC(clientID, secret)
+	m.idp = newOIDC(issuer, clientID, secret, &http.Client{Timeout: 10 * time.Second})
 	m.now = time.Now
 	m.log = ctx.Logger()
 	return nil
@@ -71,7 +72,12 @@ func (m *Auth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	if d.NextArg() {
 		return d.ArgErr()
 	}
+	seen := map[string]bool{}
 	for d.NextBlock(0) {
+		if seen[d.Val()] {
+			return d.Errf("duplicate subdirective '%s'", d.Val())
+		}
+		seen[d.Val()] = true
 		switch d.Val() {
 		case "client_id":
 			if !d.AllArgs(&m.ClientID) {

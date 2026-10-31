@@ -2,23 +2,15 @@ package castelnuovo
 
 import (
 	"context"
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
-	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"runtime"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +18,6 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
-	"golang.org/x/oauth2"
 )
 
 const (
@@ -101,7 +92,7 @@ func newTest() (*Auth, *fakePocketID) {
 	return &Auth{store: newStore(), idp: idp, now: time.Now, log: zap.NewNop()}, idp
 }
 
-func request(method, target, uri string, cookies ...*http.Cookie) *http.Request {
+func httpRequest(method, target, uri string, cookies ...*http.Cookie) *http.Request {
 	req := httptest.NewRequest(method, target, nil)
 	req.Host = host
 	if uri != "" {
@@ -132,7 +123,7 @@ func serve(s *Auth, req *http.Request) *http.Response {
 }
 
 func get(s *Auth, path, uri string, cookies ...*http.Cookie) *http.Response {
-	return serve(s, request(http.MethodGet, path, uri, cookies...))
+	return serve(s, httpRequest(http.MethodGet, path, uri, cookies...))
 }
 
 func cookie(resp *http.Response, name string) *http.Cookie {
@@ -193,18 +184,19 @@ func TestLogin(t *testing.T) {
 func TestLoginRejects(t *testing.T) {
 	tests := map[string]struct {
 		uri    string
-		change func(*claims)
+		change func(*fakePocketID)
 	}{
-		"certificate of another user":                   {otherCert, func(*claims) {}},
-		"certificate of another user without a passkey": {otherCert, func(c *claims) { c.AMR = nil }},
-		"nonce does not match":                          {cert, func(c *claims) { c.Nonce = "other" }},
-		"no subject":                                    {cert, func(c *claims) { c.Subject = "" }},
-		"no passkey":                                    {cert, func(c *claims) { c.AMR = []string{"otp"} }},
+		"certificate of another user":                   {otherCert, func(*fakePocketID) {}},
+		"certificate of another user without a passkey": {otherCert, func(f *fakePocketID) { f.claims.AMR = nil }},
+		"nonce does not match":                          {cert, func(f *fakePocketID) { f.claims.Nonce = "other" }},
+		"no subject":                                    {cert, func(f *fakePocketID) { f.claims.Subject = "" }},
+		"no passkey":                                    {cert, func(f *fakePocketID) { f.claims.AMR = []string{"otp"} }},
+		"code rejected":                                 {cert, func(f *fakePocketID) { f.exchangeErr = errors.New("invalid_grant") }},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			s, idp := newTest()
-			tt.change(&idp.claims)
+			tt.change(idp)
 			if resp := logIn(t, s, tt.uri); resp.StatusCode != http.StatusForbidden || cookie(resp, sessionCookie) != nil {
 				t.Fatalf("status %d", resp.StatusCode)
 			}
@@ -345,7 +337,7 @@ func TestVerifyRejects(t *testing.T) {
 		})
 	}
 
-	req := request(http.MethodGet, "/page", cert, session)
+	req := httpRequest(http.MethodGet, "/page", cert, session)
 	req.Host = "other.castelnuovo.eu"
 	if resp := serve(s, req); resp.StatusCode != http.StatusFound {
 		t.Fatalf("another host: %d", resp.StatusCode)
@@ -372,7 +364,7 @@ func TestChallenge(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			req := request(tt.method, "/page", cert)
+			req := httpRequest(tt.method, "/page", cert)
 			if tt.mode != "" {
 				req.Header.Set("Sec-Fetch-Mode", tt.mode)
 			}
@@ -390,7 +382,7 @@ func TestMethodNotAllowed(t *testing.T) {
 		if allow == http.MethodPost {
 			method = http.MethodGet
 		}
-		if resp := serve(s, request(method, path, cert)); resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != allow {
+		if resp := serve(s, httpRequest(method, path, cert)); resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != allow {
 			t.Fatalf("%s %s: %d, Allow %q", method, path, resp.StatusCode, resp.Header.Get("Allow"))
 		}
 	}
@@ -399,7 +391,7 @@ func TestMethodNotAllowed(t *testing.T) {
 func TestRewrittenRequest(t *testing.T) {
 	s, _ := newTest()
 	rewritten := func(original, target string) *http.Request {
-		req := request(http.MethodGet, target, cert)
+		req := httpRequest(http.MethodGet, target, cert)
 		u, _ := url.Parse(original)
 		return req.WithContext(context.WithValue(req.Context(), caddyhttp.OriginalRequestCtxKey, http.Request{URL: u}))
 	}
@@ -492,7 +484,7 @@ func TestCancelledRequestKeepsSession(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	serve(s, request(http.MethodGet, "/page", cert, session).WithContext(ctx))
+	serve(s, httpRequest(http.MethodGet, "/page", cert, session).WithContext(ctx))
 
 	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusOK {
 		t.Fatalf("after a cancelled request: %d", resp.StatusCode)
@@ -549,7 +541,7 @@ func TestLogout(t *testing.T) {
 	s, idp := newTest()
 	session := cookie(logIn(t, s, cert), sessionCookie)
 
-	req := request(http.MethodPost, "/.castelnuovo/logout", cert)
+	req := httpRequest(http.MethodPost, "/.castelnuovo/logout", cert)
 	req.Header.Set("Sec-Fetch-Site", "cross-site")
 	if resp := serve(s, req); resp.StatusCode != http.StatusForbidden || cookie(resp, sessionCookie) != nil {
 		t.Fatalf("cross-site POST: %d", resp.StatusCode)
@@ -561,7 +553,7 @@ func TestLogout(t *testing.T) {
 		t.Fatalf("refresh: %d", resp.StatusCode)
 	}
 
-	resp := serve(s, request(http.MethodPost, "/.castelnuovo/logout", cert, session))
+	resp := serve(s, httpRequest(http.MethodPost, "/.castelnuovo/logout", cert, session))
 	if cleared := cookie(resp, sessionCookie); resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != idp.logoutURL("refreshed-id-token", "https://"+host+"/") || cleared == nil || cleared.MaxAge >= 0 {
 		t.Fatalf("POST: %d %s", resp.StatusCode, resp.Header.Get("Location"))
 	}
@@ -569,7 +561,7 @@ func TestLogout(t *testing.T) {
 	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusFound {
 		t.Fatalf("after logout: %d", resp.StatusCode)
 	}
-	if resp := serve(s, request(http.MethodPost, "/.castelnuovo/logout", cert, session)); resp.Header.Get("Location") != idp.logoutURL("", "https://"+host+"/") {
+	if resp := serve(s, httpRequest(http.MethodPost, "/.castelnuovo/logout", cert, session)); resp.Header.Get("Location") != idp.logoutURL("", "https://"+host+"/") {
 		t.Fatalf("POST without a session: %s", resp.Header.Get("Location"))
 	}
 }
@@ -589,7 +581,7 @@ func TestLogoutDuringRefresh(t *testing.T) {
 	go func() { refreshing <- get(s, "/page", cert, session).StatusCode }()
 	<-entered
 	go func() { waiting <- get(s, "/page", cert, session).StatusCode }()
-	go func() { logout <- serve(s, request(http.MethodPost, logoutPath, cert, session)) }()
+	go func() { logout <- serve(s, httpRequest(http.MethodPost, logoutPath, cert, session)) }()
 	for deadline := time.Now().Add(5 * time.Second); s.store.get(session.Value) != nil; runtime.Gosched() {
 		if time.Now().After(deadline) {
 			t.Fatal("logout did not remove the session")
@@ -612,13 +604,13 @@ func TestRemovesSpoofedHeaders(t *testing.T) {
 	s, _ := newTest()
 	session := cookie(logIn(t, s, cert), sessionCookie)
 
-	req := request(http.MethodGet, "/page", cert, session)
+	req := httpRequest(http.MethodGet, "/page", cert, session)
 	req.Header.Set("X_Auth_User", "spoofed")
 	if resp := serve(s, req); resp.StatusCode != http.StatusOK || resp.Header.Get("X-Auth-User") != "luca" || resp.Header.Get("X_Auth_User") != "" {
 		t.Fatalf("app received %v", resp.Header)
 	}
 
-	req = request(http.MethodGet, "/page", "", session)
+	req = httpRequest(http.MethodGet, "/page", "", session)
 	req.Header.Set("X_Auth_User", "spoofed")
 	if resp := serve(s, req); resp.StatusCode != http.StatusForbidden || req.Header.Get("X_Auth_User") != "" || req.Header.Get("X-Auth-User") != "" || req.Header.Get("Cookie") != "" {
 		t.Fatalf("denied request kept %v", req.Header)
@@ -629,7 +621,7 @@ func TestKeepsAppCookies(t *testing.T) {
 	s, _ := newTest()
 	session := cookie(logIn(t, s, cert), sessionCookie)
 
-	req := request(http.MethodGet, "/page", cert)
+	req := httpRequest(http.MethodGet, "/page", cert)
 	req.Header.Add("Cookie", `prefs={"theme":"dark"}; `+session.Name+"="+session.Value+`; name=café; path=a\b`)
 	req.Header.Add("Cookie", loginCookie+"STATE=pending; spaced=a b; __Host-castelnuovo-login=old")
 	want := `prefs={"theme":"dark"}; name=café; path=a\b; spaced=a b`
@@ -703,7 +695,7 @@ func TestLogs(t *testing.T) {
 
 	session := cookie(logIn(t, s, cert), sessionCookie)
 	get(s, "/page", otherCert, session)
-	serve(s, request(http.MethodPost, logoutPath, cert, session))
+	serve(s, httpRequest(http.MethodPost, logoutPath, cert, session))
 	for _, message := range []string{"user logged in", "session used from another host or certificate", "user logged out"} {
 		entries := logs.FilterMessage(message).All()
 		if len(entries) != 1 || entries[0].ContextMap()["client_ip"] != clientIP || entries[0].ContextMap()["sub"] != sub {
@@ -717,196 +709,5 @@ func TestLogs(t *testing.T) {
 	denied := logs.FilterMessage("request denied").All()
 	if len(denied) != 1 || denied[0].ContextMap()["idp_error"] != "<script>" || strings.Contains(fmt.Sprint(denied[0].ContextMap()["error"]), "script") {
 		t.Fatalf("request denied: %v", denied)
-	}
-}
-
-type tokenRequest struct {
-	form           url.Values
-	user, password string
-}
-
-type testIdP struct {
-	*httptest.Server
-	key    *rsa.PrivateKey
-	claims map[string]any
-	status int
-	omit   string
-	tokens chan tokenRequest
-}
-
-func newIdP(t *testing.T) *testIdP {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p := &testIdP{key: key, tokens: make(chan tokenRequest, 10)}
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /.well-known/jwks.json", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
-			"kty": "RSA",
-			"kid": "test",
-			"alg": "RS256",
-			"use": "sig",
-			"n":   base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
-			"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes()),
-		}}})
-	})
-	mux.HandleFunc("POST /api/oidc/token", func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		user, password, _ := r.BasicAuth()
-		p.tokens <- tokenRequest{r.PostForm, user, password}
-		w.Header().Set("Content-Type", "application/json")
-		if p.status != 0 {
-			w.WriteHeader(p.status)
-			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
-			return
-		}
-		response := map[string]any{
-			"access_token":  "access-token",
-			"token_type":    "Bearer",
-			"expires_in":    3600,
-			"id_token":      p.sign(),
-			"refresh_token": "new-refresh-token",
-		}
-		delete(response, p.omit)
-		_ = json.NewEncoder(w).Encode(response)
-	})
-	p.Server = httptest.NewTLSServer(mux)
-	t.Cleanup(p.Close)
-	p.claims = map[string]any{
-		"iss":       p.URL,
-		"aud":       "client",
-		"sub":       sub,
-		"exp":       time.Now().Add(time.Hour).Unix(),
-		"iat":       time.Now().Unix(),
-		"nonce":     "nonce",
-		"amr":       []string{"phr"},
-		"auth_time": time.Now().Unix(),
-		"groups":    []string{"admins"},
-	}
-	return p
-}
-
-func (p *testIdP) sign() string {
-	payload, _ := json.Marshal(p.claims)
-	input := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","kid":"test"}`)) + "." + base64.RawURLEncoding.EncodeToString(payload)
-	digest := sha256.Sum256([]byte(input))
-	signature, _ := rsa.SignPKCS1v15(nil, p.key, crypto.SHA256, digest[:])
-	return input + "." + base64.RawURLEncoding.EncodeToString(signature)
-}
-
-func (p *testIdP) client() *oidcClient {
-	return newOIDC(p.URL, "client", "secret", p.Client())
-}
-
-func TestOIDCAuthURL(t *testing.T) {
-	o := newOIDC(issuer, "client", "secret", http.DefaultClient)
-	verifier := oauth2.GenerateVerifier()
-	for _, reauth := range []bool{false, true} {
-		u, _ := url.Parse(o.authURL("https://"+host+callbackPath, "state", "nonce", verifier, reauth))
-		want := url.Values{
-			"client_id":             {"client"},
-			"redirect_uri":          {"https://" + host + callbackPath},
-			"response_type":         {"code"},
-			"scope":                 {"openid profile email groups offline_access"},
-			"state":                 {"state"},
-			"nonce":                 {"nonce"},
-			"code_challenge":        {oauth2.S256ChallengeFromVerifier(verifier)},
-			"code_challenge_method": {"S256"},
-			"max_age":               {"3600"},
-		}
-		if reauth {
-			want.Set("prompt", "login")
-		}
-		if u.Scheme+"://"+u.Host+u.Path != issuer+"/authorize" || !maps.EqualFunc(u.Query(), want, slices.Equal[[]string]) {
-			t.Fatalf("reauth %v: %s", reauth, u)
-		}
-	}
-}
-
-func TestOIDCExchange(t *testing.T) {
-	p := newIdP(t)
-	c, refreshToken, err := p.client().exchange(context.Background(), "https://"+host+callbackPath, "code", "verifier")
-	if err != nil || c.Subject != sub || c.Nonce != "nonce" || !slices.Equal(c.AMR, []string{"phr"}) || !slices.Equal(c.Groups, []string{"admins"}) || c.idToken == "" || refreshToken != "new-refresh-token" {
-		t.Fatalf("%v %+v %q", err, c, refreshToken)
-	}
-
-	req := <-p.tokens
-	want := url.Values{
-		"grant_type":    {"authorization_code"},
-		"code":          {"code"},
-		"code_verifier": {"verifier"},
-		"redirect_uri":  {"https://" + host + callbackPath},
-	}
-	if req.user != "client" || req.password != "secret" || !maps.EqualFunc(req.form, want, slices.Equal[[]string]) {
-		t.Fatalf("token request: %+v", req)
-	}
-}
-
-func TestOIDCExchangeFails(t *testing.T) {
-	tests := map[string]struct {
-		change      func(*testIdP)
-		requests    int
-		unavailable bool
-	}{
-		"code rejected":    {func(p *testIdP) { p.status = http.StatusBadRequest }, 1, false},
-		"server error":     {func(p *testIdP) { p.status = http.StatusServiceUnavailable }, 1, true},
-		"rate limited":     {func(p *testIdP) { p.status = http.StatusTooManyRequests }, 1, true},
-		"unreachable":      {func(p *testIdP) { p.Close() }, 0, true},
-		"no ID token":      {func(p *testIdP) { p.omit = "id_token" }, 1, false},
-		"no refresh token": {func(p *testIdP) { p.omit = "refresh_token" }, 1, false},
-		"another audience": {func(p *testIdP) { p.claims["aud"] = "other" }, 1, false},
-		"expired ID token": {func(p *testIdP) { p.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, 1, false},
-		"malformed claims": {func(p *testIdP) { p.claims["auth_time"] = "yesterday" }, 1, false},
-	}
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			p := newIdP(t)
-			o := p.client()
-			tt.change(p)
-			_, _, err := o.exchange(context.Background(), "https://"+host+callbackPath, "code", "verifier")
-			if err == nil || errors.Is(err, errUnavailable) != tt.unavailable || len(p.tokens) != tt.requests {
-				t.Fatalf("error %v after %d token requests", err, len(p.tokens))
-			}
-		})
-	}
-}
-
-func TestOIDCRefresh(t *testing.T) {
-	p := newIdP(t)
-	o := p.client()
-
-	p.omit = "refresh_token"
-	c, refreshToken, err := o.refresh(context.Background(), "old-refresh-token")
-	if err != nil || c.Subject != sub || refreshToken != "old-refresh-token" {
-		t.Fatalf("%v %+v %q", err, c, refreshToken)
-	}
-	req := <-p.tokens
-	want := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"old-refresh-token"}}
-	if req.user != "client" || req.password != "secret" || !maps.EqualFunc(req.form, want, slices.Equal[[]string]) {
-		t.Fatalf("token request: %+v", req)
-	}
-
-	p.status = http.StatusBadRequest
-	if _, _, err := o.refresh(context.Background(), "old-refresh-token"); err == nil || errors.Is(err, errUnavailable) {
-		t.Fatalf("rejected refresh token: %v", err)
-	}
-	p.status = http.StatusBadGateway
-	if _, _, err := o.refresh(context.Background(), "old-refresh-token"); !errors.Is(err, errUnavailable) {
-		t.Fatalf("server error: %v", err)
-	}
-}
-
-func TestOIDCLogoutURL(t *testing.T) {
-	o := newOIDC(issuer, "client", "secret", http.DefaultClient)
-	redirect := "https://" + host + "/"
-	for idToken, want := range map[string]url.Values{
-		"id-token": {"id_token_hint": {"id-token"}, "client_id": {"client"}, "post_logout_redirect_uri": {redirect}},
-		"":         {"client_id": {"client"}, "post_logout_redirect_uri": {redirect}},
-	} {
-		u, _ := url.Parse(o.logoutURL(idToken, redirect))
-		if u.Scheme+"://"+u.Host+u.Path != issuer+"/api/oidc/end-session" || !maps.EqualFunc(u.Query(), want, slices.Equal[[]string]) {
-			t.Fatalf("ID token %q: %s", idToken, u)
-		}
 	}
 }

@@ -28,7 +28,7 @@ xcaddy build --with github.com/castelnuovo/caddy-castelnuovo
 
 ## castelnuovo_auth
 
-Protects a site with a login at `https://id.castelnuovo.eu`, which must run Pocket ID v2.17.0 or later. Without `client_certificate off`, the site also needs a client certificate.
+Protects a site with a login at `https://id.castelnuovo.eu`, which must run Pocket ID v2.19.0 or later. Without `client_certificate off`, the site also needs a client certificate.
 
 ```caddyfile
 {

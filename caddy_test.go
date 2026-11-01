@@ -62,7 +62,7 @@ func TestProvision(t *testing.T) {
 	provision := func(secret string) *Auth {
 		t.Helper()
 		m := &Auth{ClientID: "{env.TEST_CASTELNUOVO_CLIENT_ID}", ClientSecret: secret}
-		if err := m.Provision(ctx); err != nil || m.idp == nil {
+		if err := m.Provision(ctx); err != nil || m.idp == nil || m.idp.(*oidcClient).http.Timeout == 0 {
 			t.Fatalf("%v %+v", err, m)
 		}
 		return m

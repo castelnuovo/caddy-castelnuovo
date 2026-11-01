@@ -1,6 +1,7 @@
 package castelnuovo
 
 import (
+	"cmp"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -30,6 +31,7 @@ type tokenRequest struct {
 
 type testIdP struct {
 	key        *rsa.PrivateKey
+	signer     *rsa.PrivateKey
 	claims     map[string]any
 	down       bool
 	status     int
@@ -94,7 +96,7 @@ func (p *testIdP) sign() string {
 	payload, _ := json.Marshal(p.claims)
 	input := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","kid":"test"}`)) + "." + base64.RawURLEncoding.EncodeToString(payload)
 	digest := sha256.Sum256([]byte(input))
-	signature, _ := rsa.SignPKCS1v15(nil, p.key, crypto.SHA256, digest[:])
+	signature, _ := rsa.SignPKCS1v15(nil, cmp.Or(p.signer, p.key), crypto.SHA256, digest[:])
 	return input + "." + base64.RawURLEncoding.EncodeToString(signature)
 }
 
@@ -171,6 +173,7 @@ func TestOIDCExchangeFails(t *testing.T) {
 		"another audience": {func(p *testIdP) { p.claims["aud"] = "other" }, 1, false},
 		"another issuer":   {func(p *testIdP) { p.claims["iss"] = "https://evil.example" }, 1, false},
 		"expired ID token": {func(p *testIdP) { p.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, 1, false},
+		"another signer":   {func(p *testIdP) { p.signer = must(rsa.GenerateKey(rand.Reader, 2048)) }, 1, false},
 		"keys unavailable": {func(p *testIdP) { p.jwksStatus = http.StatusServiceUnavailable }, 1, true},
 	}
 	for name, tt := range tests {
@@ -203,6 +206,24 @@ func TestOIDCRefresh(t *testing.T) {
 	p.status = http.StatusBadGateway
 	if _, err := o.refresh(context.Background(), "old-refresh-token"); !errors.Is(err, errUnavailable) {
 		t.Fatalf("server error: %v", err)
+	}
+}
+
+func TestOIDCRefreshVerifiesIDToken(t *testing.T) {
+	for name, change := range map[string]func(*testIdP){
+		"no ID token":      func(p *testIdP) { p.omit = "id_token" },
+		"another audience": func(p *testIdP) { p.claims["aud"] = "other" },
+		"another issuer":   func(p *testIdP) { p.claims["iss"] = "https://evil.example" },
+		"expired ID token": func(p *testIdP) { p.claims["exp"] = time.Now().Add(-time.Hour).Unix() },
+		"another signer":   func(p *testIdP) { p.signer = must(rsa.GenerateKey(rand.Reader, 2048)) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, o := newIdP(t)
+			change(p)
+			if _, err := o.refresh(context.Background(), "old-refresh-token"); err == nil || errors.Is(err, errUnavailable) || len(p.requests) != 1 {
+				t.Fatalf("error %v after %d token requests", err, len(p.requests))
+			}
+		})
 	}
 }
 

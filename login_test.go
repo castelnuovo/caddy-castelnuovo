@@ -152,6 +152,21 @@ func TestLongRedirect(t *testing.T) {
 			t.Fatalf("redirect of %d bytes: %d, location of %d bytes", len(rd), resp.StatusCode, len(resp.Header.Get("Location")))
 		}
 	}
+
+	kept := 0
+	for n := 2800; n < 3000; n++ {
+		rd := "/" + strings.Repeat("a", n)
+		switch resp := finishLogin(t, m, idp, get(t, m, loginPath+"?rd="+rd, cert), cert); resp.Header.Get("Location") {
+		case rd:
+			kept++
+		case "/":
+		default:
+			t.Fatalf("redirect of %d bytes: %d", len(rd), resp.StatusCode)
+		}
+	}
+	if kept == 0 || kept == 200 {
+		t.Fatalf("kept %d of 200 redirects near the cookie limit", kept)
+	}
 }
 
 func TestRedirectsOnlyToLocalPaths(t *testing.T) {

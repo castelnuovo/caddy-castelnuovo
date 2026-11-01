@@ -262,7 +262,7 @@ func serve(t *testing.T, m *Auth, r *http.Request) *http.Response {
 	resp := rec.Result()
 	for _, line := range resp.Header.Values("Set-Cookie") {
 		c, err := http.ParseSetCookie(line)
-		if err != nil || len(line) > maxCookieSize || !strings.HasPrefix(c.Name, "__Host-") || c.Path != "/" || c.Domain != "" || !c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode {
+		if err != nil || len(line) > maxCookieSize || c.MaxAge == 0 || !strings.HasPrefix(c.Name, "__Host-") || c.Path != "/" || c.Domain != "" || !c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode {
 			t.Errorf("unsafe cookie %q", line)
 		}
 	}
@@ -354,6 +354,7 @@ func TestChallenge(t *testing.T) {
 		"websocket":              {http.MethodGet, "websocket", "websocket", http.StatusUnauthorized},
 		"form post":              {http.MethodPost, "navigate", "document", http.StatusUnauthorized},
 		"head":                   {http.MethodHead, "", "", http.StatusUnauthorized},
+		"fetch without dest":     {http.MethodGet, "no-cors", "", http.StatusUnauthorized},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -421,11 +422,23 @@ func TestClientCertificateRequired(t *testing.T) {
 		"certificate without owner": "spiffe://castelnuovo.eu/yubikey/87654321",
 		"owner is not a user ID":    "spiffe://castelnuovo.eu/yubikey/87654321/owner/luca",
 		"another trust domain":      "spiffe://example.com/yubikey/87654321/owner/" + sub,
+		"owner followed by a path":  cert + "/x",
+		"user URI inside another":   "spiffe://example.com/" + cert,
 	} {
 		for path, method := range map[string]string{"/page": http.MethodGet, loginPath: http.MethodGet, callbackPath: http.MethodGet, logoutPath: http.MethodPost} {
 			if resp := serve(t, m, httpRequest(method, path, uri, session)); resp.StatusCode != http.StatusForbidden || len(resp.Cookies()) != 0 {
 				t.Fatalf("%s on %s: %d %v", name, path, resp.StatusCode, resp.Cookies())
 			}
+		}
+	}
+
+	unverified := httpRequest(http.MethodGet, "/page", cert, session)
+	unverified.TLS = &tls.ConnectionState{PeerCertificates: unverified.TLS.VerifiedChains[0]}
+	second := httpRequest(http.MethodGet, "/page", "spiffe://castelnuovo.eu/client/backup", session)
+	second.TLS.VerifiedChains[0][0].URIs = append(second.TLS.VerifiedChains[0][0].URIs, must(url.Parse(cert)))
+	for name, req := range map[string]*http.Request{"unverified certificate": unverified, "user URI after another URI": second} {
+		if resp := serve(t, m, req); resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s: %d", name, resp.StatusCode)
 		}
 	}
 }

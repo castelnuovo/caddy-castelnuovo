@@ -25,11 +25,11 @@ type Auth struct {
 	ClientSecret             string `json:"client_secret"`
 	DisableClientCertificate bool   `json:"disable_client_certificate,omitempty"`
 
-	aead      cipher.AEAD
-	idp       pocketID
-	refreshes singleflight.Group
-	now       func() time.Time
-	log       *zap.Logger
+	cookieCipher     cipher.AEAD
+	identityProvider pocketID
+	runningRefreshes singleflight.Group
+	now              func() time.Time
+	log              *zap.Logger
 }
 
 func (*Auth) CaddyModule() caddy.ModuleInfo {
@@ -39,9 +39,48 @@ func (*Auth) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-func (m *Auth) Provision(ctx caddy.Context) error {
-	repl := caddy.NewReplacer()
-	clientID, secret := repl.ReplaceAll(m.ClientID, ""), repl.ReplaceAll(m.ClientSecret, "")
+func parseCaddyfile(helper httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	auth := new(Auth)
+	err := auth.UnmarshalCaddyfile(helper.Dispenser)
+	return auth, err
+}
+
+func (auth *Auth) UnmarshalCaddyfile(dispenser *caddyfile.Dispenser) error {
+	dispenser.Next()
+	if dispenser.NextArg() {
+		return dispenser.ArgErr()
+	}
+	seenSubdirectives := map[string]bool{}
+	for dispenser.NextBlock(0) {
+		if seenSubdirectives[dispenser.Val()] {
+			return dispenser.Errf("duplicate subdirective '%s'", dispenser.Val())
+		}
+		seenSubdirectives[dispenser.Val()] = true
+		switch dispenser.Val() {
+		case "client_id":
+			if !dispenser.AllArgs(&auth.ClientID) {
+				return dispenser.ArgErr()
+			}
+		case "client_secret":
+			if !dispenser.AllArgs(&auth.ClientSecret) {
+				return dispenser.ArgErr()
+			}
+		case "client_certificate":
+			var value string
+			if !dispenser.AllArgs(&value) || value != "off" {
+				return dispenser.Err("client_certificate only accepts 'off'")
+			}
+			auth.DisableClientCertificate = true
+		default:
+			return dispenser.Errf("unrecognized subdirective '%s'", dispenser.Val())
+		}
+	}
+	return nil
+}
+
+func (auth *Auth) Provision(ctx caddy.Context) error {
+	replacer := caddy.NewReplacer()
+	clientID, secret := replacer.ReplaceAll(auth.ClientID, ""), replacer.ReplaceAll(auth.ClientSecret, "")
 	switch {
 	case clientID == "":
 		return errors.New("client_id is empty")
@@ -49,54 +88,15 @@ func (m *Auth) Provision(ctx caddy.Context) error {
 		return errors.New("client_secret is empty")
 	}
 
-	aead, err := newAEAD(secret)
+	cookieCipher, err := newCookieCipher(secret)
 	if err != nil {
 		return err
 	}
-	m.aead = aead
-	m.idp = newOIDC(issuer, clientID, secret, &http.Client{Timeout: 10 * time.Second})
-	m.now = time.Now
-	m.log = ctx.Logger()
+	auth.cookieCipher = cookieCipher
+	auth.identityProvider = newOIDCClient(issuer, clientID, secret, &http.Client{Timeout: 10 * time.Second})
+	auth.now = time.Now
+	auth.log = ctx.Logger()
 	return nil
-}
-
-func (m *Auth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	d.Next()
-	if d.NextArg() {
-		return d.ArgErr()
-	}
-	seen := map[string]bool{}
-	for d.NextBlock(0) {
-		if seen[d.Val()] {
-			return d.Errf("duplicate subdirective '%s'", d.Val())
-		}
-		seen[d.Val()] = true
-		switch d.Val() {
-		case "client_id":
-			if !d.AllArgs(&m.ClientID) {
-				return d.ArgErr()
-			}
-		case "client_secret":
-			if !d.AllArgs(&m.ClientSecret) {
-				return d.ArgErr()
-			}
-		case "client_certificate":
-			var value string
-			if !d.AllArgs(&value) || value != "off" {
-				return d.Err("client_certificate only accepts 'off'")
-			}
-			m.DisableClientCertificate = true
-		default:
-			return d.Errf("unrecognized subdirective '%s'", d.Val())
-		}
-	}
-	return nil
-}
-
-func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
-	m := new(Auth)
-	err := m.UnmarshalCaddyfile(h.Dispenser)
-	return m, err
 }
 
 var (

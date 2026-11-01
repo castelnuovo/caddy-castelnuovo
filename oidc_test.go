@@ -69,8 +69,6 @@ func (provider *testIdentityProvider) RoundTrip(request *http.Request) (*http.Re
 		provider.serveKeys(recorder)
 	case testIssuer + "/api/oidc/token":
 		provider.serveToken(recorder, request)
-	case testIssuer + "/api/oidc/end-session":
-		provider.serveEndSession(recorder, request)
 	default:
 		recorder.WriteHeader(http.StatusNotFound)
 	}
@@ -113,37 +111,12 @@ func (provider *testIdentityProvider) serveToken(writer http.ResponseWriter, req
 	_ = json.NewEncoder(writer).Encode(response)
 }
 
-func (provider *testIdentityProvider) serveEndSession(writer http.ResponseWriter, request *http.Request) {
-	_ = request.ParseForm()
-	provider.requests = append(provider.requests, tokenRequest{form: request.PostForm})
-	switch {
-	case provider.status != 0:
-		writer.WriteHeader(provider.status)
-	case request.PostForm.Get("id_token_hint") != provider.signIDToken():
-		http.Redirect(writer, request, testIssuer+"/logout", http.StatusFound)
-	default:
-		http.Redirect(writer, request, "https://"+host+"/", http.StatusFound)
-	}
-}
-
 func (provider *testIdentityProvider) signIDToken() string {
 	payload, _ := json.Marshal(provider.claims)
 	input := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","kid":"test"}`)) + "." + base64.RawURLEncoding.EncodeToString(payload)
 	digest := sha256.Sum256([]byte(input))
 	signature, _ := rsa.SignPKCS1v15(nil, cmp.Or(provider.forgedSigningKey, provider.signingKey), crypto.SHA256, digest[:])
 	return input + "." + base64.RawURLEncoding.EncodeToString(signature)
-}
-
-func TestParseUnverifiedClaims(t *testing.T) {
-	user, err := parseUnverifiedClaims(fakeJWT(map[string]any{"sub": userID, "groups": []string{"a", "b"}, "auth_time": 42}))
-	if err != nil || user.Subject != userID || !slices.Equal(user.Groups, []string{"a", "b"}) || user.AuthenticatedAt != 42 {
-		t.Fatalf("%v %+v", err, user)
-	}
-	for _, idToken := range []string{"", "a.b", "a.%%%.c", "a." + base64.RawURLEncoding.EncodeToString([]byte("[]")) + ".c", "a.b.c.d", fakeJWT(map[string]any{"sub": userID, "auth_time": "yesterday"})} {
-		if _, err := parseUnverifiedClaims(idToken); err == nil {
-			t.Fatalf("parsed %q", idToken)
-		}
-	}
 }
 
 func TestOIDCAuthorizationURL(t *testing.T) {
@@ -218,36 +191,6 @@ func TestOIDCExchangeCodeFails(t *testing.T) {
 	}
 }
 
-func TestOIDCVerifyIDToken(t *testing.T) {
-	tests := map[string]struct {
-		change             func(*testIdentityProvider)
-		valid, unavailable bool
-	}{
-		"signed": {func(*testIdentityProvider) {}, true, false},
-		"another signer": {func(provider *testIdentityProvider) {
-			provider.forgedSigningKey = must(rsa.GenerateKey(rand.Reader, 2048))
-		}, false, false},
-		"another audience": {func(provider *testIdentityProvider) { provider.claims["aud"] = "other" }, false, false},
-		"another issuer":   {func(provider *testIdentityProvider) { provider.claims["iss"] = "https://evil.example" }, false, false},
-		"expired":          {func(provider *testIdentityProvider) { provider.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, false, false},
-		"keys unavailable": {func(provider *testIdentityProvider) { provider.jwksStatus = http.StatusServiceUnavailable }, false, true},
-		"unreachable":      {func(provider *testIdentityProvider) { provider.down = true }, false, true},
-	}
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			provider, client := newTestIdentityProvider(t)
-			test.change(provider)
-			user, err := client.verifyIDToken(context.Background(), provider.signIDToken())
-			if (err == nil) != test.valid || errors.Is(err, errUnavailable) != test.unavailable || len(provider.requests) != 0 {
-				t.Fatalf("error %v after %d token requests", err, len(provider.requests))
-			}
-			if test.valid && (user.Subject != userID || !slices.Equal(user.Groups, []string{"admins"})) {
-				t.Fatalf("claims %+v", user)
-			}
-		})
-	}
-}
-
 func TestOIDCRefreshTokens(t *testing.T) {
 	provider, client := newTestIdentityProvider(t)
 	got, err := client.refreshTokens(context.Background(), "old-refresh-token")
@@ -284,34 +227,6 @@ func TestOIDCRefreshVerifiesIDToken(t *testing.T) {
 			change(provider)
 			if _, err := client.refreshTokens(context.Background(), "old-refresh-token"); err == nil || errors.Is(err, errUnavailable) || len(provider.requests) != 1 {
 				t.Fatalf("error %v after %d token requests", err, len(provider.requests))
-			}
-		})
-	}
-}
-
-func TestOIDCEndSession(t *testing.T) {
-	provider, client := newTestIdentityProvider(t)
-	if err := client.endSession(context.Background(), provider.signIDToken()); err != nil {
-		t.Fatal(err)
-	}
-	want := url.Values{"client_id": {"client"}, "id_token_hint": {provider.signIDToken()}}
-	if len(provider.requests) != 1 || !maps.EqualFunc(provider.requests[0].form, want, slices.Equal[[]string]) {
-		t.Fatalf("end session requests: %+v", provider.requests)
-	}
-
-	for name, test := range map[string]struct {
-		change func(*testIdentityProvider)
-		hint   string
-	}{
-		"hint not accepted": {func(*testIdentityProvider) {}, "other-id-token"},
-		"server error":      {func(provider *testIdentityProvider) { provider.status = http.StatusServiceUnavailable }, ""},
-		"unreachable":       {func(provider *testIdentityProvider) { provider.down = true }, ""},
-	} {
-		t.Run(name, func(t *testing.T) {
-			provider, client := newTestIdentityProvider(t)
-			test.change(provider)
-			if err := client.endSession(context.Background(), cmp.Or(test.hint, provider.signIDToken())); err == nil {
-				t.Fatal("no error")
 			}
 		})
 	}

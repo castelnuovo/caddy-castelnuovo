@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -59,26 +60,33 @@ func TestProvision(t *testing.T) {
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
 	defer cancel()
 
-	provision := func(secret string) *Auth {
+	provision := func(clientID string) *Auth {
 		t.Helper()
-		auth := &Auth{ClientID: "{env.TEST_CASTELNUOVO_CLIENT_ID}", ClientSecret: secret}
+		auth := &Auth{ClientID: clientID, ClientSecret: "{env.TEST_CASTELNUOVO_CLIENT_SECRET}"}
 		if err := auth.Provision(ctx); err != nil || auth.identityProvider == nil || auth.identityProvider.(*oidcClient).httpClient.Timeout == 0 {
 			t.Fatalf("%v %+v", err, auth)
 		}
 		return auth
 	}
-	first := provision("{env.TEST_CASTELNUOVO_CLIENT_SECRET}")
-	cookie, err := first.sealCookie(sessionCookieName, session{Host: host}, 60)
-	if err != nil {
-		t.Fatal(err)
+	first := provision("{env.TEST_CASTELNUOVO_CLIENT_ID}")
+	now := time.Now()
+	id := first.sessions.add(session{expiresAt: now.Add(time.Hour)}, now)
+	reloaded, other := provision("client"), provision("other-client")
+	if _, found := reloaded.sessions.get(id); !found {
+		t.Fatal("a config reload lost the session")
 	}
-
-	var stored session
-	if err := provision("secret").openCookie(sessionCookieName, cookie.Value, &stored); err != nil || stored.Host != host {
-		t.Fatalf("after a restart: %v", err)
+	if other.sessions == first.sessions {
+		t.Fatal("two OIDC clients share a session store")
 	}
-	if err := provision("other secret").openCookie(sessionCookieName, cookie.Value, &stored); err == nil {
-		t.Fatal("another client secret opened the cookie")
+	for _, auth := range []*Auth{first, reloaded, other} {
+		if err := auth.Cleanup(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fresh := provision("client")
+	defer fresh.Cleanup()
+	if _, found := fresh.sessions.get(id); found {
+		t.Fatal("the session store outlived its last site")
 	}
 
 	for _, auth := range []*Auth{{ClientSecret: "secret"}, {ClientID: "client"}, {ClientID: "{env.TEST_CASTELNUOVO_MISSING}", ClientSecret: "secret"}} {

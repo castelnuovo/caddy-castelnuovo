@@ -1,7 +1,6 @@
 package castelnuovo
 
 import (
-	"crypto/cipher"
 	"errors"
 	"net/http"
 	"time"
@@ -11,7 +10,6 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
-	"golang.org/x/sync/singleflight"
 )
 
 func init() {
@@ -20,14 +18,16 @@ func init() {
 	httpcaddyfile.RegisterDirectiveOrder("castelnuovo_auth", httpcaddyfile.Before, "basic_auth")
 }
 
+var sessionStores = caddy.NewUsagePool()
+
 type Auth struct {
 	ClientID                 string `json:"client_id"`
 	ClientSecret             string `json:"client_secret"`
 	DisableClientCertificate bool   `json:"disable_client_certificate,omitempty"`
 
-	cookieCipher     cipher.AEAD
+	sessionStoreKey  string
+	sessions         *sessionStore
 	identityProvider pocketID
-	runningRefreshes singleflight.Group
 	now              func() time.Time
 	log              *zap.Logger
 }
@@ -88,19 +88,27 @@ func (auth *Auth) Provision(ctx caddy.Context) error {
 		return errors.New("client_secret is empty")
 	}
 
-	cookieCipher, err := newCookieCipher(secret)
+	store, _, err := sessionStores.LoadOrNew(clientID, func() (caddy.Destructor, error) {
+		return newSessionStore(), nil
+	})
 	if err != nil {
 		return err
 	}
-	auth.cookieCipher = cookieCipher
+	auth.sessionStoreKey, auth.sessions = clientID, store.(*sessionStore)
 	auth.identityProvider = newOIDCClient(issuer, clientID, secret, &http.Client{Timeout: 10 * time.Second})
 	auth.now = time.Now
 	auth.log = ctx.Logger()
 	return nil
 }
 
+func (auth *Auth) Cleanup() error {
+	_, err := sessionStores.Delete(auth.sessionStoreKey)
+	return err
+}
+
 var (
 	_ caddy.Provisioner           = (*Auth)(nil)
+	_ caddy.CleanerUpper          = (*Auth)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Auth)(nil)
 	_ caddyfile.Unmarshaler       = (*Auth)(nil)
 )

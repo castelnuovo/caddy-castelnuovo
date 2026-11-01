@@ -120,7 +120,9 @@ func (m *Auth) checkLogin(c claims, nonce, cert string) error {
 }
 
 func (m *Auth) logout(req *request) error {
-	if err := crossOrigin.Check(req.orig); err != nil {
+	r := req.r.WithContext(req.r.Context())
+	r.Method = req.orig.Method
+	if err := crossOrigin.Check(r); err != nil {
 		return req.deny(http.StatusForbidden, err)
 	}
 	expire(req.w, sessionCookie)

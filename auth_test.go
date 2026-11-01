@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
@@ -239,7 +240,9 @@ func httpRequest(method, target, uri string, cookies ...*http.Cookie) *http.Requ
 	for _, c := range cookies {
 		r.AddCookie(c)
 	}
-	return r.WithContext(context.WithValue(r.Context(), caddyhttp.VarsCtxKey, map[string]any{caddyhttp.ClientIPVarKey: clientIP}))
+	r = caddyhttp.PrepareRequest(r, caddy.NewReplacer(), nil, nil)
+	caddyhttp.SetVar(r.Context(), caddyhttp.ClientIPVarKey, clientIP)
+	return r
 }
 
 func serve(t *testing.T, m *Auth, r *http.Request) *http.Response {
@@ -384,10 +387,9 @@ func TestMethodNotAllowed(t *testing.T) {
 func TestRoutesOnOriginalRequest(t *testing.T) {
 	m, idp := newTest(t)
 	rewritten := func(method, original, target string) *http.Request {
-		req := httpRequest(http.MethodGet, target, cert)
-		orig := *req
-		orig.Method, orig.URL = method, must(url.Parse(original))
-		return req.WithContext(context.WithValue(req.Context(), caddyhttp.OriginalRequestCtxKey, orig))
+		req := httpRequest(method, original, cert)
+		req.Method, req.URL, req.RequestURI = http.MethodGet, must(url.Parse(target)), target
+		return req
 	}
 
 	if resp := serve(t, m, rewritten(http.MethodGet, "/app/page?x=1", "/page?x=1")); resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != loginPath+"?rd=%2Fapp%2Fpage%3Fx%3D1" {

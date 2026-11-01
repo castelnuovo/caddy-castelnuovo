@@ -86,7 +86,7 @@ Sessions live in memory, and the session cookie only holds a random ID. A config
 
 Every 5 minutes the handler refreshes the session at `id.castelnuovo.eu`. This picks up changes to the user's name, email and groups, and ends the session of a disabled user. While a refresh is due and `id.castelnuovo.eu` cannot be reached, requests get status 502.
 
-A request without a session is redirected to the login when it loads a page, and gets status 401 otherwise. A browser has one login in progress at a time. Starting another one, for example in a second tab, replaces it, so finishing the first one gets status 400 until the page is reloaded.
+A request without a session is redirected to the login when it loads a page, and gets status 401 otherwise. Every login in progress gets its own cookie, so logins in several tabs at once all work and return to their own page. A login has to be finished within 5 minutes.
 
 ### Logout
 

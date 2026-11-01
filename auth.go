@@ -28,13 +28,13 @@ const (
 	logoutPath   = "/.castelnuovo/logout"
 
 	sessionCookieName = "__Host-castelnuovo"
-	loginCookieName   = "__Host-castelnuovo-login"
+	loginCookiePrefix = "__Host-castelnuovo-login-"
 	maxCookieSize     = 4096
 
 	sessionLifetime      = 12 * time.Hour
 	refreshInterval      = 5 * time.Minute
 	maxAuthenticationAge = time.Hour
-	loginTimeout         = 10 * time.Minute
+	loginTimeout         = 5 * time.Minute
 )
 
 var (
@@ -48,7 +48,7 @@ type requestState struct {
 	original      *http.Request
 	certificate   string
 	sessionCookie string
-	loginCookie   string
+	loginCookies  map[string]string
 	log           *zap.Logger
 }
 
@@ -101,7 +101,7 @@ func (auth *Auth) newRequestState(response http.ResponseWriter, httpRequest *htt
 	if original, ok := httpRequest.Context().Value(caddyhttp.OriginalRequestCtxKey).(http.Request); ok {
 		request.original = &original
 	}
-	request.sessionCookie, request.loginCookie = extractOwnCookies(httpRequest)
+	request.sessionCookie, request.loginCookies = extractOwnCookies(httpRequest)
 	if !auth.DisableClientCertificate {
 		request.certificate = clientCertificateURI(httpRequest)
 	}
@@ -117,7 +117,8 @@ func (auth *Auth) newRequestState(response http.ResponseWriter, httpRequest *htt
 	return request
 }
 
-func extractOwnCookies(httpRequest *http.Request) (sessionCookie, loginCookie string) {
+func extractOwnCookies(httpRequest *http.Request) (sessionCookie string, loginCookies map[string]string) {
+	loginCookies = map[string]string{}
 	var kept []string
 	for _, line := range httpRequest.Header.Values("Cookie") {
 		for part := range strings.SplitSeq(line, ";") {
@@ -127,8 +128,8 @@ func extractOwnCookies(httpRequest *http.Request) (sessionCookie, loginCookie st
 			switch {
 			case name == sessionCookieName:
 				sessionCookie = value
-			case name == loginCookieName:
-				loginCookie = value
+			case strings.HasPrefix(name, loginCookiePrefix):
+				loginCookies[strings.TrimPrefix(name, loginCookiePrefix)] = value
 			case part != "":
 				kept = append(kept, part)
 			}
@@ -138,7 +139,7 @@ func extractOwnCookies(httpRequest *http.Request) (sessionCookie, loginCookie st
 	if len(kept) > 0 {
 		httpRequest.Header.Set("Cookie", strings.Join(kept, "; "))
 	}
-	return sessionCookie, loginCookie
+	return sessionCookie, loginCookies
 }
 
 func clientCertificateURI(httpRequest *http.Request) string {
@@ -228,21 +229,21 @@ func requireLogin(request *requestState) error {
 }
 
 type pendingLogin struct {
-	State        string `json:"s"`
 	Nonce        string `json:"n"`
 	CodeVerifier string `json:"v"`
 	Redirect     string `json:"r,omitempty"`
 }
 
 func (auth *Auth) startLogin(request *requestState) {
-	pending := pendingLogin{State: rand.Text(), Nonce: rand.Text(), CodeVerifier: oauth2.GenerateVerifier(), Redirect: request.original.URL.Query().Get("rd")}
-	cookie := newCookie(loginCookieName, pending.encode(), int(loginTimeout.Seconds()))
+	state := rand.Text()
+	pending := pendingLogin{Nonce: rand.Text(), CodeVerifier: oauth2.GenerateVerifier(), Redirect: request.original.URL.Query().Get("rd")}
+	cookie := newCookie(loginCookiePrefix+state, pending.encode(), int(loginTimeout.Seconds()))
 	if len(cookie.String()) > maxCookieSize {
 		pending.Redirect = ""
 		cookie.Value = pending.encode()
 	}
 	http.SetCookie(request.response, cookie)
-	http.Redirect(request.response, request.current, auth.identityProvider.authorizationURL(callbackURL(request.current.Host), pending.State, pending.Nonce, pending.CodeVerifier), http.StatusFound)
+	http.Redirect(request.response, request.current, auth.identityProvider.authorizationURL(callbackURL(request.current.Host), state, pending.Nonce, pending.CodeVerifier), http.StatusFound)
 }
 
 func (pending pendingLogin) encode() string {
@@ -256,17 +257,16 @@ func callbackURL(host string) string {
 
 func (auth *Auth) finishLogin(request *requestState) error {
 	query := request.original.URL.Query()
-	pending, err := decodePendingLogin(request.loginCookie)
-	switch {
-	case request.loginCookie == "":
+	state := query.Get("state")
+	encodedLogin, found := request.loginCookies[state]
+	if !found || state == "" {
 		return request.deny(http.StatusBadRequest, errors.New("callback without a pending login"))
-	case err != nil || pending.State == "":
-		expireCookie(request.response, loginCookieName)
-		return request.deny(http.StatusBadRequest, errors.New("login cookie is invalid"))
-	case pending.State != query.Get("state"):
-		return request.deny(http.StatusBadRequest, errors.New("callback belongs to another login"))
 	}
-	expireCookie(request.response, loginCookieName)
+	expireCookie(request.response, loginCookiePrefix+state)
+	pending, err := decodePendingLogin(encodedLogin)
+	if err != nil {
+		return request.deny(http.StatusBadRequest, errors.New("login cookie is invalid"))
+	}
 	if query.Get("code") == "" {
 		return request.deny(http.StatusForbidden, errors.New("identity provider returned an error"), zap.String("idp_error", query.Get("error")))
 	}

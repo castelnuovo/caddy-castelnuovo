@@ -4,7 +4,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY *.go ./
+COPY . ./
 RUN go vet ./... && go test ./...
 RUN xcaddy build --output /caddy --with github.com/castelnuovo/caddy-castelnuovo=/src
 

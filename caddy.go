@@ -39,25 +39,10 @@ func (*Auth) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-func (auth *Auth) Provision(ctx caddy.Context) error {
-	replacer := caddy.NewReplacer()
-	clientID, secret := replacer.ReplaceAll(auth.ClientID, ""), replacer.ReplaceAll(auth.ClientSecret, "")
-	switch {
-	case clientID == "":
-		return errors.New("client_id is empty")
-	case secret == "":
-		return errors.New("client_secret is empty")
-	}
-
-	cookieCipher, err := newCookieCipher(secret)
-	if err != nil {
-		return err
-	}
-	auth.cookieCipher = cookieCipher
-	auth.identityProvider = newOIDCClient(issuer, clientID, secret, &http.Client{Timeout: 10 * time.Second})
-	auth.now = time.Now
-	auth.log = ctx.Logger()
-	return nil
+func parseCaddyfile(helper httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	auth := new(Auth)
+	err := auth.UnmarshalCaddyfile(helper.Dispenser)
+	return auth, err
 }
 
 func (auth *Auth) UnmarshalCaddyfile(dispenser *caddyfile.Dispenser) error {
@@ -93,10 +78,25 @@ func (auth *Auth) UnmarshalCaddyfile(dispenser *caddyfile.Dispenser) error {
 	return nil
 }
 
-func parseCaddyfile(helper httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
-	auth := new(Auth)
-	err := auth.UnmarshalCaddyfile(helper.Dispenser)
-	return auth, err
+func (auth *Auth) Provision(ctx caddy.Context) error {
+	replacer := caddy.NewReplacer()
+	clientID, secret := replacer.ReplaceAll(auth.ClientID, ""), replacer.ReplaceAll(auth.ClientSecret, "")
+	switch {
+	case clientID == "":
+		return errors.New("client_id is empty")
+	case secret == "":
+		return errors.New("client_secret is empty")
+	}
+
+	cookieCipher, err := newCookieCipher(secret)
+	if err != nil {
+		return err
+	}
+	auth.cookieCipher = cookieCipher
+	auth.identityProvider = newOIDCClient(issuer, clientID, secret, &http.Client{Timeout: 10 * time.Second})
+	auth.now = time.Now
+	auth.log = ctx.Logger()
+	return nil
 }
 
 var (

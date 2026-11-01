@@ -22,8 +22,8 @@ var errUnavailable = errors.New("identity provider is unavailable")
 type pocketID interface {
 	authorizationURL(redirectURL, state, nonce, codeVerifier string) string
 	exchangeCode(ctx context.Context, redirectURL, code, codeVerifier string) (tokenResponse, error)
-	refreshTokens(ctx context.Context, refreshToken string) (tokenResponse, error)
 	verifyIDToken(ctx context.Context, idToken string) (claims, error)
+	refreshTokens(ctx context.Context, refreshToken string) (tokenResponse, error)
 	endSession(ctx context.Context, idToken string) error
 	logoutURL(idToken, redirectURL string) string
 }
@@ -108,15 +108,6 @@ func (client *oidcClient) exchangeCode(ctx context.Context, redirectURL, code, c
 	return client.verifyTokenResponse(ctx, token)
 }
 
-func (client *oidcClient) refreshTokens(ctx context.Context, refreshToken string) (tokenResponse, error) {
-	ctx = oidc.ClientContext(ctx, client.httpClient)
-	token, err := client.oauthConfig.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
-	if err != nil {
-		return tokenResponse{}, classifyTokenError(err)
-	}
-	return client.verifyTokenResponse(ctx, token)
-}
-
 func classifyTokenError(err error) error {
 	if retrieveError, ok := errors.AsType[*oauth2.RetrieveError](err); ok && retrieveError.Response != nil && retrieveError.Response.StatusCode < 500 && retrieveError.Response.StatusCode != http.StatusTooManyRequests {
 		return err
@@ -146,6 +137,15 @@ func (client *oidcClient) verifyIDToken(ctx context.Context, idToken string) (cl
 		return verifiedClaims, err
 	}
 	return verifiedClaims, parsedToken.Claims(&verifiedClaims)
+}
+
+func (client *oidcClient) refreshTokens(ctx context.Context, refreshToken string) (tokenResponse, error) {
+	ctx = oidc.ClientContext(ctx, client.httpClient)
+	token, err := client.oauthConfig.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
+	if err != nil {
+		return tokenResponse{}, classifyTokenError(err)
+	}
+	return client.verifyTokenResponse(ctx, token)
 }
 
 func (client *oidcClient) endSession(ctx context.Context, idToken string) error {

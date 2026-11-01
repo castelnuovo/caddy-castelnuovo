@@ -10,6 +10,21 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
+func TestCaddyfileDirective(t *testing.T) {
+	adaptedJSON, _, err := caddyconfig.GetAdapter("caddyfile").Adapt([]byte(`app.castelnuovo.eu {
+	respond ok
+	castelnuovo_auth {
+		client_id {env.CLIENT_ID}
+		client_secret {env.CLIENT_SECRET}
+	}
+}`), nil)
+	config := string(adaptedJSON)
+	authPosition, respondPosition := strings.Index(config, `"handler":"castelnuovo_auth"`), strings.Index(config, `"handler":"static_response"`)
+	if err != nil || authPosition < 0 || respondPosition < authPosition || !strings.Contains(config, `"client_id":"{env.CLIENT_ID}"`) {
+		t.Fatalf("%v %s", err, config)
+	}
+}
+
 func TestUnmarshalCaddyfile(t *testing.T) {
 	var auth Auth
 	err := auth.UnmarshalCaddyfile(caddyfile.NewTestDispenser(`castelnuovo_auth {
@@ -35,21 +50,6 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		if err := auth.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err == nil {
 			t.Fatalf("%s: accepted %+v", name, &auth)
 		}
-	}
-}
-
-func TestCaddyfileDirective(t *testing.T) {
-	adaptedJSON, _, err := caddyconfig.GetAdapter("caddyfile").Adapt([]byte(`app.castelnuovo.eu {
-	respond ok
-	castelnuovo_auth {
-		client_id {env.CLIENT_ID}
-		client_secret {env.CLIENT_SECRET}
-	}
-}`), nil)
-	config := string(adaptedJSON)
-	authPosition, respondPosition := strings.Index(config, `"handler":"castelnuovo_auth"`), strings.Index(config, `"handler":"static_response"`)
-	if err != nil || authPosition < 0 || respondPosition < authPosition || !strings.Contains(config, `"client_id":"{env.CLIENT_ID}"`) {
-		t.Fatalf("%v %s", err, config)
 	}
 }
 

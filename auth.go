@@ -56,26 +56,6 @@ type requestState struct {
 	log           *zap.Logger
 }
 
-type session struct {
-	IDToken      string `json:"i"`
-	RefreshToken string `json:"r"`
-	RefreshedAt  int64  `json:"f"`
-	ExpiresAt    int64  `json:"x"`
-	Host         string `json:"h"`
-	Certificate  string `json:"c,omitempty"`
-}
-
-type pendingLogin struct {
-	Nonce        string `json:"n"`
-	CodeVerifier string `json:"v"`
-	Redirect     string `json:"r,omitempty"`
-}
-
-type refreshResult struct {
-	cookie *http.Cookie
-	claims claims
-}
-
 func (auth *Auth) ServeHTTP(response http.ResponseWriter, httpRequest *http.Request, next caddyhttp.Handler) error {
 	removeIncomingAuthHeaders(httpRequest)
 	request := auth.newRequestState(response, httpRequest)
@@ -111,6 +91,14 @@ func (auth *Auth) ServeHTTP(response http.ResponseWriter, httpRequest *http.Requ
 	return next.ServeHTTP(response, httpRequest)
 }
 
+func removeIncomingAuthHeaders(httpRequest *http.Request) {
+	for name := range httpRequest.Header {
+		if strings.HasPrefix(strings.ToUpper(strings.ReplaceAll(name, "_", "-")), "X-AUTH-") {
+			delete(httpRequest.Header, name)
+		}
+	}
+}
+
 func (auth *Auth) newRequestState(response http.ResponseWriter, httpRequest *http.Request) *requestState {
 	request := &requestState{response: response, current: httpRequest, original: httpRequest}
 	if original, ok := httpRequest.Context().Value(caddyhttp.OriginalRequestCtxKey).(http.Request); ok {
@@ -132,23 +120,67 @@ func (auth *Auth) newRequestState(response http.ResponseWriter, httpRequest *htt
 	return request
 }
 
+func extractOwnCookies(httpRequest *http.Request) (sessionCookie string, loginCookies map[string]string) {
+	loginCookies = map[string]string{}
+	var kept []string
+	for _, line := range httpRequest.Header.Values("Cookie") {
+		for part := range strings.SplitSeq(line, ";") {
+			part = strings.TrimSpace(part)
+			name, value, _ := strings.Cut(part, "=")
+			name, value = strings.TrimSpace(name), strings.TrimSpace(value)
+			switch {
+			case name == sessionCookieName:
+				sessionCookie = value
+			case strings.HasPrefix(name, loginCookiePrefix):
+				loginCookies[strings.TrimPrefix(name, loginCookiePrefix)] = value
+			case part != "":
+				kept = append(kept, part)
+			}
+		}
+	}
+	httpRequest.Header.Del("Cookie")
+	if len(kept) > 0 {
+		httpRequest.Header.Set("Cookie", strings.Join(kept, "; "))
+	}
+	return sessionCookie, loginCookies
+}
+
+func clientCertificateURI(httpRequest *http.Request) string {
+	if httpRequest.TLS == nil || len(httpRequest.TLS.VerifiedChains) == 0 || len(httpRequest.TLS.VerifiedChains[0][0].URIs) == 0 {
+		return ""
+	}
+	return httpRequest.TLS.VerifiedChains[0][0].URIs[0].String()
+}
+
+func certificateOwner(uri string) string {
+	if match := yubikeyCertificateURI.FindStringSubmatch(uri); match != nil {
+		return match[1]
+	}
+	return ""
+}
+
 func (request *requestState) deny(status int, err error, fields ...zap.Field) error {
 	request.log.Warn("request denied", append(fields, zap.String("path", request.original.URL.Path), zap.Error(err))...)
 	return caddyhttp.Error(status, err)
 }
 
-func requireLogin(request *requestState) error {
-	fetchMode, fetchDestination := request.current.Header.Get("Sec-Fetch-Mode"), request.current.Header.Get("Sec-Fetch-Dest")
-	if request.original.Method != http.MethodGet || fetchMode != "" && fetchMode != "navigate" || fetchDestination != "" && fetchDestination != "document" {
-		return caddyhttp.Error(http.StatusUnauthorized, errors.New("login required"))
-	}
-	http.Redirect(request.response, request.current, loginPath+"?rd="+url.QueryEscape(request.original.URL.RequestURI()), http.StatusFound)
-	return nil
-}
-
 func methodNotAllowed(response http.ResponseWriter, path, allow string) error {
 	response.Header().Set("Allow", allow)
 	return caddyhttp.Error(http.StatusMethodNotAllowed, fmt.Errorf("%s only accepts %s", path, allow))
+}
+
+type session struct {
+	IDToken      string `json:"i"`
+	RefreshToken string `json:"r"`
+	RefreshedAt  int64  `json:"f"`
+	ExpiresAt    int64  `json:"x"`
+	Host         string `json:"h"`
+	Certificate  string `json:"c,omitempty"`
+}
+
+type refreshResult struct {
+	cookie *http.Cookie
+	claims claims
 }
 
 func (auth *Auth) authenticate(request *requestState) (*claims, error) {
@@ -184,6 +216,14 @@ func (auth *Auth) authenticate(request *requestState) (*claims, error) {
 	return &refreshed.claims, nil
 }
 
+func (auth *Auth) openSessionCookie(request *requestState) (stored session, subject string, ok bool) {
+	if auth.openCookie(sessionCookieName, request.sessionCookie, &stored) != nil {
+		return session{}, "", false
+	}
+	unverified, err := parseUnverifiedClaims(stored.IDToken)
+	return stored, unverified.Subject, err == nil
+}
+
 func (auth *Auth) refreshSession(ctx context.Context, stored session, subject string) (refreshResult, error) {
 	issued, err := auth.identityProvider.refreshTokens(ctx, stored.RefreshToken)
 	switch {
@@ -201,16 +241,23 @@ func (auth *Auth) refreshSession(ctx context.Context, stored session, subject st
 	return refreshResult{cookie, issued.claims}, err
 }
 
-func (auth *Auth) openSessionCookie(request *requestState) (stored session, subject string, ok bool) {
-	if auth.openCookie(sessionCookieName, request.sessionCookie, &stored) != nil {
-		return session{}, "", false
-	}
-	unverified, err := parseUnverifiedClaims(stored.IDToken)
-	return stored, unverified.Subject, err == nil
-}
-
 func (auth *Auth) sealSessionCookie(stored session) (*http.Cookie, error) {
 	return auth.sealCookie(sessionCookieName, stored, int(stored.ExpiresAt-stored.RefreshedAt))
+}
+
+func requireLogin(request *requestState) error {
+	fetchMode, fetchDestination := request.current.Header.Get("Sec-Fetch-Mode"), request.current.Header.Get("Sec-Fetch-Dest")
+	if request.original.Method != http.MethodGet || fetchMode != "" && fetchMode != "navigate" || fetchDestination != "" && fetchDestination != "document" {
+		return caddyhttp.Error(http.StatusUnauthorized, errors.New("login required"))
+	}
+	http.Redirect(request.response, request.current, loginPath+"?rd="+url.QueryEscape(request.original.URL.RequestURI()), http.StatusFound)
+	return nil
+}
+
+type pendingLogin struct {
+	Nonce        string `json:"n"`
+	CodeVerifier string `json:"v"`
+	Redirect     string `json:"r,omitempty"`
 }
 
 func (auth *Auth) startLogin(request *requestState) error {
@@ -232,6 +279,10 @@ func (auth *Auth) startLogin(request *requestState) error {
 	http.SetCookie(request.response, cookie)
 	http.Redirect(request.response, request.current, auth.identityProvider.authorizationURL(callbackURL(request.current.Host), state, pending.Nonce, pending.CodeVerifier), http.StatusFound)
 	return nil
+}
+
+func callbackURL(host string) string {
+	return "https://" + host + callbackPath
 }
 
 func (auth *Auth) finishLogin(request *requestState) error {
@@ -301,6 +352,10 @@ func (auth *Auth) checkLoginClaims(user claims, nonce, certificate string) error
 	return nil
 }
 
+func isLocalPath(path string) bool {
+	return strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "//") && !strings.Contains(path, `\`) && !strings.ContainsFunc(path, unicode.IsControl)
+}
+
 func (auth *Auth) logout(request *requestState) error {
 	withOriginalMethod := request.current.WithContext(request.current.Context())
 	withOriginalMethod.Method = request.original.Method
@@ -355,10 +410,6 @@ func (auth *Auth) openCookie(name, sealedValue string, target any) error {
 	return json.Unmarshal(plaintext, target)
 }
 
-func expireCookie(response http.ResponseWriter, name string) {
-	http.SetCookie(response, newCookie(name, "", -1))
-}
-
 func newCookie(name, value string, maxAge int) *http.Cookie {
 	return &http.Cookie{
 		Name:     name,
@@ -371,57 +422,6 @@ func newCookie(name, value string, maxAge int) *http.Cookie {
 	}
 }
 
-func extractOwnCookies(httpRequest *http.Request) (sessionCookie string, loginCookies map[string]string) {
-	loginCookies = map[string]string{}
-	var kept []string
-	for _, line := range httpRequest.Header.Values("Cookie") {
-		for part := range strings.SplitSeq(line, ";") {
-			part = strings.TrimSpace(part)
-			name, value, _ := strings.Cut(part, "=")
-			name, value = strings.TrimSpace(name), strings.TrimSpace(value)
-			switch {
-			case name == sessionCookieName:
-				sessionCookie = value
-			case strings.HasPrefix(name, loginCookiePrefix):
-				loginCookies[strings.TrimPrefix(name, loginCookiePrefix)] = value
-			case part != "":
-				kept = append(kept, part)
-			}
-		}
-	}
-	httpRequest.Header.Del("Cookie")
-	if len(kept) > 0 {
-		httpRequest.Header.Set("Cookie", strings.Join(kept, "; "))
-	}
-	return sessionCookie, loginCookies
-}
-
-func removeIncomingAuthHeaders(httpRequest *http.Request) {
-	for name := range httpRequest.Header {
-		if strings.HasPrefix(strings.ToUpper(strings.ReplaceAll(name, "_", "-")), "X-AUTH-") {
-			delete(httpRequest.Header, name)
-		}
-	}
-}
-
-func clientCertificateURI(httpRequest *http.Request) string {
-	if httpRequest.TLS == nil || len(httpRequest.TLS.VerifiedChains) == 0 || len(httpRequest.TLS.VerifiedChains[0][0].URIs) == 0 {
-		return ""
-	}
-	return httpRequest.TLS.VerifiedChains[0][0].URIs[0].String()
-}
-
-func certificateOwner(uri string) string {
-	if match := yubikeyCertificateURI.FindStringSubmatch(uri); match != nil {
-		return match[1]
-	}
-	return ""
-}
-
-func isLocalPath(path string) bool {
-	return strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "//") && !strings.Contains(path, `\`) && !strings.ContainsFunc(path, unicode.IsControl)
-}
-
-func callbackURL(host string) string {
-	return "https://" + host + callbackPath
+func expireCookie(response http.ResponseWriter, name string) {
+	http.SetCookie(response, newCookie(name, "", -1))
 }

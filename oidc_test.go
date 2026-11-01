@@ -40,6 +40,25 @@ type testIdentityProvider struct {
 	requests         []tokenRequest
 }
 
+func newTestIdentityProvider(t *testing.T) (*testIdentityProvider, *oidcClient) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &testIdentityProvider{signingKey: key, claims: map[string]any{
+		"iss":       testIssuer,
+		"aud":       "client",
+		"sub":       userID,
+		"exp":       time.Now().Add(time.Hour).Unix(),
+		"iat":       time.Now().Unix(),
+		"nonce":     "nonce",
+		"amr":       []string{"phr"},
+		"auth_time": time.Now().Unix(),
+		"groups":    []string{"admins"},
+	}}
+	return provider, newOIDCClient(testIssuer, "client", "secret", &http.Client{Transport: provider})
+}
+
 func (provider *testIdentityProvider) RoundTrip(request *http.Request) (*http.Response, error) {
 	if provider.down {
 		return nil, errors.New("connection refused")
@@ -115,23 +134,16 @@ func (provider *testIdentityProvider) signIDToken() string {
 	return input + "." + base64.RawURLEncoding.EncodeToString(signature)
 }
 
-func newTestIdentityProvider(t *testing.T) (*testIdentityProvider, *oidcClient) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
+func TestParseUnverifiedClaims(t *testing.T) {
+	user, err := parseUnverifiedClaims(fakeJWT(map[string]any{"sub": userID, "groups": []string{"a", "b"}, "auth_time": 42}))
+	if err != nil || user.Subject != userID || !slices.Equal(user.Groups, []string{"a", "b"}) || user.AuthenticatedAt != 42 {
+		t.Fatalf("%v %+v", err, user)
 	}
-	provider := &testIdentityProvider{signingKey: key, claims: map[string]any{
-		"iss":       testIssuer,
-		"aud":       "client",
-		"sub":       userID,
-		"exp":       time.Now().Add(time.Hour).Unix(),
-		"iat":       time.Now().Unix(),
-		"nonce":     "nonce",
-		"amr":       []string{"phr"},
-		"auth_time": time.Now().Unix(),
-		"groups":    []string{"admins"},
-	}}
-	return provider, newOIDCClient(testIssuer, "client", "secret", &http.Client{Transport: provider})
+	for _, idToken := range []string{"", "a.b", "a.%%%.c", "a." + base64.RawURLEncoding.EncodeToString([]byte("[]")) + ".c", "a.b.c.d", fakeJWT(map[string]any{"sub": userID, "auth_time": "yesterday"})} {
+		if _, err := parseUnverifiedClaims(idToken); err == nil {
+			t.Fatalf("parsed %q", idToken)
+		}
+	}
 }
 
 func TestOIDCAuthorizationURL(t *testing.T) {
@@ -206,6 +218,36 @@ func TestOIDCExchangeCodeFails(t *testing.T) {
 	}
 }
 
+func TestOIDCVerifyIDToken(t *testing.T) {
+	tests := map[string]struct {
+		change             func(*testIdentityProvider)
+		valid, unavailable bool
+	}{
+		"signed": {func(*testIdentityProvider) {}, true, false},
+		"another signer": {func(provider *testIdentityProvider) {
+			provider.forgedSigningKey = must(rsa.GenerateKey(rand.Reader, 2048))
+		}, false, false},
+		"another audience": {func(provider *testIdentityProvider) { provider.claims["aud"] = "other" }, false, false},
+		"another issuer":   {func(provider *testIdentityProvider) { provider.claims["iss"] = "https://evil.example" }, false, false},
+		"expired":          {func(provider *testIdentityProvider) { provider.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, false, false},
+		"keys unavailable": {func(provider *testIdentityProvider) { provider.jwksStatus = http.StatusServiceUnavailable }, false, true},
+		"unreachable":      {func(provider *testIdentityProvider) { provider.down = true }, false, true},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			provider, client := newTestIdentityProvider(t)
+			test.change(provider)
+			user, err := client.verifyIDToken(context.Background(), provider.signIDToken())
+			if (err == nil) != test.valid || errors.Is(err, errUnavailable) != test.unavailable || len(provider.requests) != 0 {
+				t.Fatalf("error %v after %d token requests", err, len(provider.requests))
+			}
+			if test.valid && (user.Subject != userID || !slices.Equal(user.Groups, []string{"admins"})) {
+				t.Fatalf("claims %+v", user)
+			}
+		})
+	}
+}
+
 func TestOIDCRefreshTokens(t *testing.T) {
 	provider, client := newTestIdentityProvider(t)
 	got, err := client.refreshTokens(context.Background(), "old-refresh-token")
@@ -242,36 +284,6 @@ func TestOIDCRefreshVerifiesIDToken(t *testing.T) {
 			change(provider)
 			if _, err := client.refreshTokens(context.Background(), "old-refresh-token"); err == nil || errors.Is(err, errUnavailable) || len(provider.requests) != 1 {
 				t.Fatalf("error %v after %d token requests", err, len(provider.requests))
-			}
-		})
-	}
-}
-
-func TestOIDCVerifyIDToken(t *testing.T) {
-	tests := map[string]struct {
-		change             func(*testIdentityProvider)
-		valid, unavailable bool
-	}{
-		"signed": {func(*testIdentityProvider) {}, true, false},
-		"another signer": {func(provider *testIdentityProvider) {
-			provider.forgedSigningKey = must(rsa.GenerateKey(rand.Reader, 2048))
-		}, false, false},
-		"another audience": {func(provider *testIdentityProvider) { provider.claims["aud"] = "other" }, false, false},
-		"another issuer":   {func(provider *testIdentityProvider) { provider.claims["iss"] = "https://evil.example" }, false, false},
-		"expired":          {func(provider *testIdentityProvider) { provider.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, false, false},
-		"keys unavailable": {func(provider *testIdentityProvider) { provider.jwksStatus = http.StatusServiceUnavailable }, false, true},
-		"unreachable":      {func(provider *testIdentityProvider) { provider.down = true }, false, true},
-	}
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			provider, client := newTestIdentityProvider(t)
-			test.change(provider)
-			user, err := client.verifyIDToken(context.Background(), provider.signIDToken())
-			if (err == nil) != test.valid || errors.Is(err, errUnavailable) != test.unavailable || len(provider.requests) != 0 {
-				t.Fatalf("error %v after %d token requests", err, len(provider.requests))
-			}
-			if test.valid && (user.Subject != userID || !slices.Equal(user.Groups, []string{"admins"})) {
-				t.Fatalf("claims %+v", user)
 			}
 		})
 	}
@@ -315,18 +327,6 @@ func TestOIDCLogoutURL(t *testing.T) {
 		location := must(url.Parse(client.logoutURL(idToken, redirect)))
 		if location.Scheme+"://"+location.Host+location.Path != issuer+"/api/oidc/end-session" || !maps.EqualFunc(location.Query(), want, slices.Equal[[]string]) {
 			t.Fatalf("ID token %q: %s", idToken, location)
-		}
-	}
-}
-
-func TestParseUnverifiedClaims(t *testing.T) {
-	user, err := parseUnverifiedClaims(fakeJWT(map[string]any{"sub": userID, "groups": []string{"a", "b"}, "auth_time": 42}))
-	if err != nil || user.Subject != userID || !slices.Equal(user.Groups, []string{"a", "b"}) || user.AuthenticatedAt != 42 {
-		t.Fatalf("%v %+v", err, user)
-	}
-	for _, idToken := range []string{"", "a.b", "a.%%%.c", "a." + base64.RawURLEncoding.EncodeToString([]byte("[]")) + ".c", "a.b.c.d", fakeJWT(map[string]any{"sub": userID, "auth_time": "yesterday"})} {
-		if _, err := parseUnverifiedClaims(idToken); err == nil {
-			t.Fatalf("parsed %q", idToken)
 		}
 	}
 }

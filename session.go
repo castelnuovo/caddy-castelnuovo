@@ -74,6 +74,9 @@ func (m *Auth) refresh(ctx context.Context, s session, sub string) (refreshed, e
 		return refreshed{}, errors.New("refresh returned another user")
 	}
 	now := m.now().Unix()
+	if now >= s.ExpiresAt {
+		return refreshed{}, errors.New("session expired during the refresh")
+	}
 	s.IDToken, s.RefreshToken, s.RefreshedAt = t.idToken, t.refreshToken, now
 	cookie, err := m.seal(sessionCookie, s, int(s.ExpiresAt-now))
 	return refreshed{cookie, c}, err

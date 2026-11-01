@@ -52,6 +52,15 @@ func TestSessionExpires(t *testing.T) {
 	if resp := get(t, m, "/page", cert, refreshed); resp.StatusCode != http.StatusFound || idp.refreshes != 1 {
 		t.Fatalf("after 12 hours: %d, %d refreshes", resp.StatusCode, idp.refreshes)
 	}
+
+	m, idp = newTest(t)
+	session = logIn(t, m, idp, cert)
+	idp.advance(sessionLifetime - time.Second)
+	idp.onRefresh = func() { idp.advance(time.Second) }
+	resp = get(t, m, "/page", cert, session)
+	if expired := cookieNamed(resp, sessionCookie); resp.StatusCode != http.StatusFound || expired == nil || expired.MaxAge >= 0 {
+		t.Fatalf("refresh that ends after 12 hours: %d %v", resp.StatusCode, resp.Cookies())
+	}
 }
 
 func TestRejectsInvalidSessionCookies(t *testing.T) {

@@ -227,6 +227,31 @@ func TestOIDCRefreshVerifiesIDToken(t *testing.T) {
 	}
 }
 
+func TestOIDCVerifyIDToken(t *testing.T) {
+	tests := map[string]struct {
+		change             func(*testIdP)
+		valid, unavailable bool
+	}{
+		"signed":           {func(*testIdP) {}, true, false},
+		"another signer":   {func(p *testIdP) { p.signer = must(rsa.GenerateKey(rand.Reader, 2048)) }, false, false},
+		"another audience": {func(p *testIdP) { p.claims["aud"] = "other" }, false, false},
+		"another issuer":   {func(p *testIdP) { p.claims["iss"] = "https://evil.example" }, false, false},
+		"expired":          {func(p *testIdP) { p.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, false, false},
+		"keys unavailable": {func(p *testIdP) { p.jwksStatus = http.StatusServiceUnavailable }, false, true},
+		"unreachable":      {func(p *testIdP) { p.down = true }, false, true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			p, o := newIdP(t)
+			tt.change(p)
+			err := o.verifyIDToken(context.Background(), p.sign())
+			if (err == nil) != tt.valid || errors.Is(err, errUnavailable) != tt.unavailable || len(p.requests) != 0 {
+				t.Fatalf("error %v after %d token requests", err, len(p.requests))
+			}
+		})
+	}
+}
+
 func TestOIDCLogoutURL(t *testing.T) {
 	o := newOIDC(issuer, "client", "secret", nil)
 	redirect := "https://" + host + "/"
@@ -246,7 +271,7 @@ func TestParseClaims(t *testing.T) {
 	if err != nil || c.Subject != sub || !slices.Equal(c.Groups, []string{"a", "b"}) || c.AuthTime != 42 {
 		t.Fatalf("%v %+v", err, c)
 	}
-	for _, idToken := range []string{"", "a.b", "a.%%%.c", "a." + base64.RawURLEncoding.EncodeToString([]byte("[]")) + ".c", "a.b.c.d"} {
+	for _, idToken := range []string{"", "a.b", "a.%%%.c", "a." + base64.RawURLEncoding.EncodeToString([]byte("[]")) + ".c", "a.b.c.d", fakeJWT(map[string]any{"sub": sub, "auth_time": "yesterday"})} {
 		if _, err := parseClaims(idToken); err == nil {
 			t.Fatalf("parsed %q", idToken)
 		}

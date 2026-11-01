@@ -23,6 +23,7 @@ type pocketID interface {
 	authURL(redirectURL, state, nonce, verifier string) string
 	exchange(ctx context.Context, redirectURL, code, verifier string) (tokens, error)
 	refresh(ctx context.Context, refreshToken string) (tokens, error)
+	verifyIDToken(ctx context.Context, idToken string) error
 	logoutURL(idToken, redirectURL string) string
 }
 
@@ -123,16 +124,21 @@ func tokenError(err error) error {
 
 func (o *oidcClient) verify(ctx context.Context, token *oauth2.Token) (tokens, error) {
 	raw, _ := token.Extra("id_token").(string)
-	if _, err := o.verifier.Verify(ctx, raw); err != nil {
-		if strings.Contains(err.Error(), "fetching keys") {
-			return tokens{}, fmt.Errorf("%w: %w", errUnavailable, err)
-		}
+	if err := o.verifyIDToken(ctx, raw); err != nil {
 		return tokens{}, err
 	}
 	if token.RefreshToken == "" {
 		return tokens{}, errors.New("token response has no refresh_token")
 	}
 	return tokens{raw, token.RefreshToken}, nil
+}
+
+func (o *oidcClient) verifyIDToken(ctx context.Context, idToken string) error {
+	_, err := o.verifier.Verify(oidc.ClientContext(ctx, o.http), idToken)
+	if err != nil && strings.Contains(err.Error(), "fetching keys") {
+		return fmt.Errorf("%w: %w", errUnavailable, err)
+	}
+	return err
 }
 
 func (o *oidcClient) logoutURL(idToken, redirectURL string) string {

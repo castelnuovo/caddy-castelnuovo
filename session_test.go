@@ -97,6 +97,44 @@ func TestRejectsInvalidSessionCookies(t *testing.T) {
 	}
 }
 
+func TestSessionNeedsSignedIDToken(t *testing.T) {
+	unsigned := func(f *fakePocketID, subject string) string {
+		return fakeJWT(map[string]any{"iss": issuer, "aud": clientID, "sub": subject, "exp": f.now().Add(time.Hour).Unix(), "amr": []string{"phr"}, "groups": []string{"admins", "users", "root"}})
+	}
+	tests := map[string]struct {
+		change func(*session, *fakePocketID)
+		status int
+	}{
+		"unsigned ID token":                            {func(s *session, f *fakePocketID) { s.IDToken, s.RefreshToken = unsigned(f, sub), "forged" }, http.StatusFound},
+		"unsigned ID token of another user":            {func(s *session, f *fakePocketID) { s.IDToken = unsigned(f, otherSub) }, http.StatusFound},
+		"unsigned ID token while the provider is down": {func(s *session, f *fakePocketID) { s.IDToken, f.down = unsigned(f, sub), true }, http.StatusBadGateway},
+		"expired ID token":                             {func(_ *session, f *fakePocketID) { f.advance(time.Hour) }, http.StatusOK},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			m, idp := newTest(t)
+			var s session
+			if err := m.open(sessionCookie, logIn(t, m, idp, cert).Value, &s); err != nil {
+				t.Fatal(err)
+			}
+			tt.change(&s, idp)
+			s.RefreshedAt = idp.now().Unix()
+			forged, err := m.seal(sessionCookie, s, 60)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			resp := get(t, m, "/page", cert, forged)
+			if resp.StatusCode != tt.status || idp.refreshes != 1 || resp.Header.Get("X-Auth-Groups") == "admins,users,root" {
+				t.Fatalf("%d %q, %d refreshes", resp.StatusCode, resp.Header.Get("X-Auth-Groups"), idp.refreshes)
+			}
+			if tt.status == http.StatusOK && (resp.Header.Get("X-Auth-Sub") != sub || cookieNamed(resp, sessionCookie) == nil) {
+				t.Fatalf("refreshed session: %q %v", resp.Header.Get("X-Auth-Sub"), resp.Cookies())
+			}
+		})
+	}
+}
+
 func TestRefreshEndsSession(t *testing.T) {
 	tests := map[string]func(*fakePocketID){
 		"user disabled":        func(f *fakePocketID) { f.disabled = true },

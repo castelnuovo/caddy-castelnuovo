@@ -82,7 +82,7 @@ Requests that reach the app carry these headers. The handler first removes every
 
 ### Sessions
 
-A session lives in an encrypted cookie, so it survives restarts and reloads of Caddy. The key comes from the client secret, so changing the secret logs everyone out. A session lasts 12 hours and only works on the host and with the client certificate it started with.
+A session lives in an encrypted cookie, so it survives restarts and reloads of Caddy. The key comes from the client secret, so changing the secret logs everyone out. The ID token in the cookie is also checked against the keys of `id.castelnuovo.eu` on every request, so the client secret alone is not enough to create a session. A session lasts 12 hours and only works on the host and with the client certificate it started with.
 
 Every 5 minutes the handler refreshes the session at `id.castelnuovo.eu`. This picks up changes to the user's name, email and groups, and ends the session of a disabled user. While a refresh is due and `id.castelnuovo.eu` cannot be reached, requests get status 502.
 

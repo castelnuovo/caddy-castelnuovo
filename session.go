@@ -34,6 +34,7 @@ func (m *Auth) authenticate(req *request) (*claims, error) {
 	if m.open(sessionCookie, req.session, &s) != nil || now >= s.ExpiresAt {
 		return nil, nil
 	}
+	ctx := context.WithoutCancel(req.r.Context())
 	c, err := parseClaims(s.IDToken)
 	switch {
 	case err != nil:
@@ -41,12 +42,12 @@ func (m *Auth) authenticate(req *request) (*claims, error) {
 	case s.Host != req.r.Host || s.Certificate != req.cert:
 		req.log.Warn("session used from another host or certificate", zap.String("sub", c.Subject), zap.String("session_host", s.Host), zap.String("session_certificate", s.Certificate))
 		return nil, nil
-	case now-s.RefreshedAt < int64(refreshInterval.Seconds()):
+	case now-s.RefreshedAt < int64(refreshInterval.Seconds()) && m.idp.verifyIDToken(ctx, s.IDToken) == nil:
 		return &c, nil
 	}
 
 	v, err, _ := m.refreshes.Do(s.RefreshToken, func() (any, error) {
-		return m.refresh(context.WithoutCancel(req.r.Context()), s, c.Subject)
+		return m.refresh(ctx, s, c.Subject)
 	})
 	switch {
 	case errors.Is(err, errUnavailable):

@@ -68,6 +68,7 @@ type fakePocketID struct {
 	codes     map[string]authorization
 	tokens    map[string]*issuedToken
 	hints     map[string]*grant
+	idTokens  map[string]time.Time
 }
 
 func (f *fakePocketID) now() time.Time {
@@ -168,7 +169,20 @@ func (f *fakePocketID) issue(g *grant, nonce string) tokens {
 	}
 	f.tokens[t.refreshToken] = &issuedToken{grant: g}
 	f.hints[t.idToken] = g
+	f.idTokens[t.idToken] = now.Add(time.Hour)
 	return t
+}
+
+func (f *fakePocketID) verifyIDToken(_ context.Context, idToken string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch expiry, ok := f.idTokens[idToken]; {
+	case !ok:
+		return errors.New("ID token was not signed by the identity provider")
+	case !f.now().Before(expiry):
+		return errors.New("ID token is expired")
+	}
+	return nil
 }
 
 func (f *fakePocketID) endSession(location string) {
@@ -215,9 +229,10 @@ func newTest(t *testing.T) (*Auth, *fakePocketID) {
 			Groups:            []string{"admins", "users"},
 			AMR:               []string{"phr"},
 		},
-		codes:  map[string]authorization{},
-		tokens: map[string]*issuedToken{},
-		hints:  map[string]*grant{},
+		codes:    map[string]authorization{},
+		tokens:   map[string]*issuedToken{},
+		hints:    map[string]*grant{},
+		idTokens: map[string]time.Time{},
 	}
 	idp.clock.Store(time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC).UnixNano())
 	return newAuth(t, idp, "secret"), idp

@@ -25,105 +25,105 @@ import (
 const testIssuer = "https://id.test"
 
 type tokenRequest struct {
-	form           url.Values
-	user, password string
+	form                             url.Values
+	basicAuthUser, basicAuthPassword string
 }
 
-type testIdP struct {
-	key        *rsa.PrivateKey
-	signer     *rsa.PrivateKey
-	claims     map[string]any
-	down       bool
-	status     int
-	jwksStatus int
-	omit       string
-	requests   []tokenRequest
+type testIdentityProvider struct {
+	signingKey       *rsa.PrivateKey
+	forgedSigningKey *rsa.PrivateKey
+	claims           map[string]any
+	down             bool
+	status           int
+	jwksStatus       int
+	omittedField     string
+	requests         []tokenRequest
 }
 
-func (p *testIdP) RoundTrip(r *http.Request) (*http.Response, error) {
-	if p.down {
+func (provider *testIdentityProvider) RoundTrip(request *http.Request) (*http.Response, error) {
+	if provider.down {
 		return nil, errors.New("connection refused")
 	}
-	rec := httptest.NewRecorder()
-	switch r.URL.String() {
+	recorder := httptest.NewRecorder()
+	switch request.URL.String() {
 	case testIssuer + "/.well-known/jwks.json":
-		p.jwks(rec)
+		provider.serveKeys(recorder)
 	case testIssuer + "/api/oidc/token":
-		p.token(rec, r)
+		provider.serveToken(recorder, request)
 	case testIssuer + "/api/oidc/end-session":
-		p.endSession(rec, r)
+		provider.serveEndSession(recorder, request)
 	default:
-		rec.WriteHeader(http.StatusNotFound)
+		recorder.WriteHeader(http.StatusNotFound)
 	}
-	return rec.Result(), nil
+	return recorder.Result(), nil
 }
 
-func (p *testIdP) jwks(w http.ResponseWriter) {
-	if p.jwksStatus != 0 {
-		w.WriteHeader(p.jwksStatus)
+func (provider *testIdentityProvider) serveKeys(writer http.ResponseWriter) {
+	if provider.jwksStatus != 0 {
+		writer.WriteHeader(provider.jwksStatus)
 		return
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
+	_ = json.NewEncoder(writer).Encode(map[string]any{"keys": []map[string]string{{
 		"kty": "RSA",
 		"kid": "test",
 		"alg": "RS256",
 		"use": "sig",
-		"n":   base64.RawURLEncoding.EncodeToString(p.key.N.Bytes()),
-		"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(p.key.E)).Bytes()),
+		"n":   base64.RawURLEncoding.EncodeToString(provider.signingKey.N.Bytes()),
+		"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(provider.signingKey.E)).Bytes()),
 	}}})
 }
 
-func (p *testIdP) token(w http.ResponseWriter, r *http.Request) {
-	_ = r.ParseForm()
-	user, password, _ := r.BasicAuth()
-	p.requests = append(p.requests, tokenRequest{r.PostForm, user, password})
-	w.Header().Set("Content-Type", "application/json")
-	if p.status != 0 {
-		w.WriteHeader(p.status)
-		_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+func (provider *testIdentityProvider) serveToken(writer http.ResponseWriter, request *http.Request) {
+	_ = request.ParseForm()
+	user, password, _ := request.BasicAuth()
+	provider.requests = append(provider.requests, tokenRequest{request.PostForm, user, password})
+	writer.Header().Set("Content-Type", "application/json")
+	if provider.status != 0 {
+		writer.WriteHeader(provider.status)
+		_, _ = writer.Write([]byte(`{"error":"invalid_grant"}`))
 		return
 	}
 	response := map[string]any{
 		"access_token":  "access-token",
 		"token_type":    "Bearer",
 		"expires_in":    3600,
-		"id_token":      p.sign(),
+		"id_token":      provider.signIDToken(),
 		"refresh_token": "new-refresh-token",
 	}
-	delete(response, p.omit)
-	_ = json.NewEncoder(w).Encode(response)
+	delete(response, provider.omittedField)
+	_ = json.NewEncoder(writer).Encode(response)
 }
 
-func (p *testIdP) endSession(w http.ResponseWriter, r *http.Request) {
-	_ = r.ParseForm()
-	p.requests = append(p.requests, tokenRequest{form: r.PostForm})
+func (provider *testIdentityProvider) serveEndSession(writer http.ResponseWriter, request *http.Request) {
+	_ = request.ParseForm()
+	provider.requests = append(provider.requests, tokenRequest{form: request.PostForm})
 	switch {
-	case p.status != 0:
-		w.WriteHeader(p.status)
-	case r.PostForm.Get("id_token_hint") != p.sign():
-		http.Redirect(w, r, testIssuer+"/logout", http.StatusFound)
+	case provider.status != 0:
+		writer.WriteHeader(provider.status)
+	case request.PostForm.Get("id_token_hint") != provider.signIDToken():
+		http.Redirect(writer, request, testIssuer+"/logout", http.StatusFound)
 	default:
-		http.Redirect(w, r, "https://"+host+"/", http.StatusFound)
+		http.Redirect(writer, request, "https://"+host+"/", http.StatusFound)
 	}
 }
 
-func (p *testIdP) sign() string {
-	payload, _ := json.Marshal(p.claims)
+func (provider *testIdentityProvider) signIDToken() string {
+	payload, _ := json.Marshal(provider.claims)
 	input := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","kid":"test"}`)) + "." + base64.RawURLEncoding.EncodeToString(payload)
 	digest := sha256.Sum256([]byte(input))
-	signature, _ := rsa.SignPKCS1v15(nil, cmp.Or(p.signer, p.key), crypto.SHA256, digest[:])
+	signature, _ := rsa.SignPKCS1v15(nil, cmp.Or(provider.forgedSigningKey, provider.signingKey), crypto.SHA256, digest[:])
 	return input + "." + base64.RawURLEncoding.EncodeToString(signature)
 }
 
-func newIdP(t *testing.T) (*testIdP, *oidcClient) {
+func newTestIdentityProvider(t *testing.T) (*testIdentityProvider, *oidcClient) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &testIdP{key: key, claims: map[string]any{
+	provider := &testIdentityProvider{signingKey: key, claims: map[string]any{
 		"iss":       testIssuer,
 		"aud":       "client",
-		"sub":       sub,
+		"sub":       userID,
 		"exp":       time.Now().Add(time.Hour).Unix(),
 		"iat":       time.Now().Unix(),
 		"nonce":     "nonce",
@@ -131,13 +131,13 @@ func newIdP(t *testing.T) (*testIdP, *oidcClient) {
 		"auth_time": time.Now().Unix(),
 		"groups":    []string{"admins"},
 	}}
-	return p, newOIDC(testIssuer, "client", "secret", &http.Client{Transport: p})
+	return provider, newOIDCClient(testIssuer, "client", "secret", &http.Client{Transport: provider})
 }
 
-func TestOIDCAuthURL(t *testing.T) {
-	o := newOIDC(issuer, "client", "secret", nil)
+func TestOIDCAuthorizationURL(t *testing.T) {
+	client := newOIDCClient(issuer, "client", "secret", nil)
 	verifier := oauth2.GenerateVerifier()
-	u := must(url.Parse(o.authURL("https://"+host+callbackPath, "state", "nonce", verifier)))
+	location := must(url.Parse(client.authorizationURL("https://"+host+callbackPath, "state", "nonce", verifier)))
 	want := url.Values{
 		"client_id":             {"client"},
 		"redirect_uri":          {"https://" + host + callbackPath},
@@ -149,17 +149,17 @@ func TestOIDCAuthURL(t *testing.T) {
 		"code_challenge_method": {"S256"},
 		"max_age":               {"3600"},
 	}
-	if u.Scheme+"://"+u.Host+u.Path != issuer+"/authorize" || !maps.EqualFunc(u.Query(), want, slices.Equal[[]string]) {
-		t.Fatalf("%s", u)
+	if location.Scheme+"://"+location.Host+location.Path != issuer+"/authorize" || !maps.EqualFunc(location.Query(), want, slices.Equal[[]string]) {
+		t.Fatalf("%s", location)
 	}
 }
 
-func TestOIDCExchange(t *testing.T) {
-	p, o := newIdP(t)
-	got, err := o.exchange(context.Background(), "https://"+host+callbackPath, "code", "verifier")
-	c := got.claims
-	if err != nil || got.idToken != p.sign() || got.refreshToken != "new-refresh-token" || c.Subject != sub || c.Nonce != "nonce" || !slices.Equal(c.AMR, []string{"phr"}) || !slices.Equal(c.Groups, []string{"admins"}) {
-		t.Fatalf("%v %+v %+v", err, got, c)
+func TestOIDCExchangeCode(t *testing.T) {
+	provider, client := newTestIdentityProvider(t)
+	got, err := client.exchangeCode(context.Background(), "https://"+host+callbackPath, "code", "verifier")
+	user := got.claims
+	if err != nil || got.idToken != provider.signIDToken() || got.refreshToken != "new-refresh-token" || user.Subject != userID || user.Nonce != "nonce" || !slices.Equal(user.AuthenticationMethods, []string{"phr"}) || !slices.Equal(user.Groups, []string{"admins"}) {
+		t.Fatalf("%v %+v %+v", err, got, user)
 	}
 
 	want := url.Values{
@@ -168,76 +168,80 @@ func TestOIDCExchange(t *testing.T) {
 		"code_verifier": {"verifier"},
 		"redirect_uri":  {"https://" + host + callbackPath},
 	}
-	if len(p.requests) != 1 || p.requests[0].user != "client" || p.requests[0].password != "secret" || !maps.EqualFunc(p.requests[0].form, want, slices.Equal[[]string]) {
-		t.Fatalf("token requests: %+v", p.requests)
+	if len(provider.requests) != 1 || provider.requests[0].basicAuthUser != "client" || provider.requests[0].basicAuthPassword != "secret" || !maps.EqualFunc(provider.requests[0].form, want, slices.Equal[[]string]) {
+		t.Fatalf("token requests: %+v", provider.requests)
 	}
 }
 
-func TestOIDCExchangeFails(t *testing.T) {
+func TestOIDCExchangeCodeFails(t *testing.T) {
 	tests := map[string]struct {
-		change      func(*testIdP)
+		change      func(*testIdentityProvider)
 		requests    int
 		unavailable bool
 	}{
-		"code rejected":    {func(p *testIdP) { p.status = http.StatusBadRequest }, 1, false},
-		"server error":     {func(p *testIdP) { p.status = http.StatusServiceUnavailable }, 1, true},
-		"rate limited":     {func(p *testIdP) { p.status = http.StatusTooManyRequests }, 1, true},
-		"unreachable":      {func(p *testIdP) { p.down = true }, 0, true},
-		"no ID token":      {func(p *testIdP) { p.omit = "id_token" }, 1, false},
-		"no refresh token": {func(p *testIdP) { p.omit = "refresh_token" }, 1, false},
-		"another audience": {func(p *testIdP) { p.claims["aud"] = "other" }, 1, false},
-		"another issuer":   {func(p *testIdP) { p.claims["iss"] = "https://evil.example" }, 1, false},
-		"expired ID token": {func(p *testIdP) { p.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, 1, false},
-		"another signer":   {func(p *testIdP) { p.signer = must(rsa.GenerateKey(rand.Reader, 2048)) }, 1, false},
-		"keys unavailable": {func(p *testIdP) { p.jwksStatus = http.StatusServiceUnavailable }, 1, true},
-		"malformed claims": {func(p *testIdP) { p.claims["auth_time"] = "yesterday" }, 1, false},
+		"code rejected":    {func(provider *testIdentityProvider) { provider.status = http.StatusBadRequest }, 1, false},
+		"server error":     {func(provider *testIdentityProvider) { provider.status = http.StatusServiceUnavailable }, 1, true},
+		"rate limited":     {func(provider *testIdentityProvider) { provider.status = http.StatusTooManyRequests }, 1, true},
+		"unreachable":      {func(provider *testIdentityProvider) { provider.down = true }, 0, true},
+		"no ID token":      {func(provider *testIdentityProvider) { provider.omittedField = "id_token" }, 1, false},
+		"no refresh token": {func(provider *testIdentityProvider) { provider.omittedField = "refresh_token" }, 1, false},
+		"another audience": {func(provider *testIdentityProvider) { provider.claims["aud"] = "other" }, 1, false},
+		"another issuer":   {func(provider *testIdentityProvider) { provider.claims["iss"] = "https://evil.example" }, 1, false},
+		"expired ID token": {func(provider *testIdentityProvider) { provider.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, 1, false},
+		"another signer": {func(provider *testIdentityProvider) {
+			provider.forgedSigningKey = must(rsa.GenerateKey(rand.Reader, 2048))
+		}, 1, false},
+		"keys unavailable": {func(provider *testIdentityProvider) { provider.jwksStatus = http.StatusServiceUnavailable }, 1, true},
+		"malformed claims": {func(provider *testIdentityProvider) { provider.claims["auth_time"] = "yesterday" }, 1, false},
 	}
-	for name, tt := range tests {
+	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			p, o := newIdP(t)
-			tt.change(p)
-			_, err := o.exchange(context.Background(), "https://"+host+callbackPath, "code", "verifier")
-			if err == nil || errors.Is(err, errUnavailable) != tt.unavailable || len(p.requests) != tt.requests {
-				t.Fatalf("error %v after %d token requests", err, len(p.requests))
+			provider, client := newTestIdentityProvider(t)
+			test.change(provider)
+			_, err := client.exchangeCode(context.Background(), "https://"+host+callbackPath, "code", "verifier")
+			if err == nil || errors.Is(err, errUnavailable) != test.unavailable || len(provider.requests) != test.requests {
+				t.Fatalf("error %v after %d token requests", err, len(provider.requests))
 			}
 		})
 	}
 }
 
-func TestOIDCRefresh(t *testing.T) {
-	p, o := newIdP(t)
-	got, err := o.refresh(context.Background(), "old-refresh-token")
-	if err != nil || got.claims.Subject != sub || got.idToken != p.sign() || got.refreshToken != "new-refresh-token" {
+func TestOIDCRefreshTokens(t *testing.T) {
+	provider, client := newTestIdentityProvider(t)
+	got, err := client.refreshTokens(context.Background(), "old-refresh-token")
+	if err != nil || got.claims.Subject != userID || got.idToken != provider.signIDToken() || got.refreshToken != "new-refresh-token" {
 		t.Fatalf("%v %+v", err, got)
 	}
 	want := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"old-refresh-token"}}
-	if len(p.requests) != 1 || p.requests[0].user != "client" || p.requests[0].password != "secret" || !maps.EqualFunc(p.requests[0].form, want, slices.Equal[[]string]) {
-		t.Fatalf("token requests: %+v", p.requests)
+	if len(provider.requests) != 1 || provider.requests[0].basicAuthUser != "client" || provider.requests[0].basicAuthPassword != "secret" || !maps.EqualFunc(provider.requests[0].form, want, slices.Equal[[]string]) {
+		t.Fatalf("token requests: %+v", provider.requests)
 	}
 
-	p.status = http.StatusBadRequest
-	if _, err := o.refresh(context.Background(), "old-refresh-token"); err == nil || errors.Is(err, errUnavailable) {
+	provider.status = http.StatusBadRequest
+	if _, err := client.refreshTokens(context.Background(), "old-refresh-token"); err == nil || errors.Is(err, errUnavailable) {
 		t.Fatalf("rejected refresh token: %v", err)
 	}
-	p.status = http.StatusBadGateway
-	if _, err := o.refresh(context.Background(), "old-refresh-token"); !errors.Is(err, errUnavailable) {
+	provider.status = http.StatusBadGateway
+	if _, err := client.refreshTokens(context.Background(), "old-refresh-token"); !errors.Is(err, errUnavailable) {
 		t.Fatalf("server error: %v", err)
 	}
 }
 
 func TestOIDCRefreshVerifiesIDToken(t *testing.T) {
-	for name, change := range map[string]func(*testIdP){
-		"no ID token":      func(p *testIdP) { p.omit = "id_token" },
-		"another audience": func(p *testIdP) { p.claims["aud"] = "other" },
-		"another issuer":   func(p *testIdP) { p.claims["iss"] = "https://evil.example" },
-		"expired ID token": func(p *testIdP) { p.claims["exp"] = time.Now().Add(-time.Hour).Unix() },
-		"another signer":   func(p *testIdP) { p.signer = must(rsa.GenerateKey(rand.Reader, 2048)) },
+	for name, change := range map[string]func(*testIdentityProvider){
+		"no ID token":      func(provider *testIdentityProvider) { provider.omittedField = "id_token" },
+		"another audience": func(provider *testIdentityProvider) { provider.claims["aud"] = "other" },
+		"another issuer":   func(provider *testIdentityProvider) { provider.claims["iss"] = "https://evil.example" },
+		"expired ID token": func(provider *testIdentityProvider) { provider.claims["exp"] = time.Now().Add(-time.Hour).Unix() },
+		"another signer": func(provider *testIdentityProvider) {
+			provider.forgedSigningKey = must(rsa.GenerateKey(rand.Reader, 2048))
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			p, o := newIdP(t)
-			change(p)
-			if _, err := o.refresh(context.Background(), "old-refresh-token"); err == nil || errors.Is(err, errUnavailable) || len(p.requests) != 1 {
-				t.Fatalf("error %v after %d token requests", err, len(p.requests))
+			provider, client := newTestIdentityProvider(t)
+			change(provider)
+			if _, err := client.refreshTokens(context.Background(), "old-refresh-token"); err == nil || errors.Is(err, errUnavailable) || len(provider.requests) != 1 {
+				t.Fatalf("error %v after %d token requests", err, len(provider.requests))
 			}
 		})
 	}
@@ -245,54 +249,56 @@ func TestOIDCRefreshVerifiesIDToken(t *testing.T) {
 
 func TestOIDCVerifyIDToken(t *testing.T) {
 	tests := map[string]struct {
-		change             func(*testIdP)
+		change             func(*testIdentityProvider)
 		valid, unavailable bool
 	}{
-		"signed":           {func(*testIdP) {}, true, false},
-		"another signer":   {func(p *testIdP) { p.signer = must(rsa.GenerateKey(rand.Reader, 2048)) }, false, false},
-		"another audience": {func(p *testIdP) { p.claims["aud"] = "other" }, false, false},
-		"another issuer":   {func(p *testIdP) { p.claims["iss"] = "https://evil.example" }, false, false},
-		"expired":          {func(p *testIdP) { p.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, false, false},
-		"keys unavailable": {func(p *testIdP) { p.jwksStatus = http.StatusServiceUnavailable }, false, true},
-		"unreachable":      {func(p *testIdP) { p.down = true }, false, true},
+		"signed": {func(*testIdentityProvider) {}, true, false},
+		"another signer": {func(provider *testIdentityProvider) {
+			provider.forgedSigningKey = must(rsa.GenerateKey(rand.Reader, 2048))
+		}, false, false},
+		"another audience": {func(provider *testIdentityProvider) { provider.claims["aud"] = "other" }, false, false},
+		"another issuer":   {func(provider *testIdentityProvider) { provider.claims["iss"] = "https://evil.example" }, false, false},
+		"expired":          {func(provider *testIdentityProvider) { provider.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, false, false},
+		"keys unavailable": {func(provider *testIdentityProvider) { provider.jwksStatus = http.StatusServiceUnavailable }, false, true},
+		"unreachable":      {func(provider *testIdentityProvider) { provider.down = true }, false, true},
 	}
-	for name, tt := range tests {
+	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			p, o := newIdP(t)
-			tt.change(p)
-			c, err := o.verifyIDToken(context.Background(), p.sign())
-			if (err == nil) != tt.valid || errors.Is(err, errUnavailable) != tt.unavailable || len(p.requests) != 0 {
-				t.Fatalf("error %v after %d token requests", err, len(p.requests))
+			provider, client := newTestIdentityProvider(t)
+			test.change(provider)
+			user, err := client.verifyIDToken(context.Background(), provider.signIDToken())
+			if (err == nil) != test.valid || errors.Is(err, errUnavailable) != test.unavailable || len(provider.requests) != 0 {
+				t.Fatalf("error %v after %d token requests", err, len(provider.requests))
 			}
-			if tt.valid && (c.Subject != sub || !slices.Equal(c.Groups, []string{"admins"})) {
-				t.Fatalf("claims %+v", c)
+			if test.valid && (user.Subject != userID || !slices.Equal(user.Groups, []string{"admins"})) {
+				t.Fatalf("claims %+v", user)
 			}
 		})
 	}
 }
 
 func TestOIDCEndSession(t *testing.T) {
-	p, o := newIdP(t)
-	if err := o.endSession(context.Background(), p.sign()); err != nil {
+	provider, client := newTestIdentityProvider(t)
+	if err := client.endSession(context.Background(), provider.signIDToken()); err != nil {
 		t.Fatal(err)
 	}
-	want := url.Values{"client_id": {"client"}, "id_token_hint": {p.sign()}}
-	if len(p.requests) != 1 || !maps.EqualFunc(p.requests[0].form, want, slices.Equal[[]string]) {
-		t.Fatalf("end session requests: %+v", p.requests)
+	want := url.Values{"client_id": {"client"}, "id_token_hint": {provider.signIDToken()}}
+	if len(provider.requests) != 1 || !maps.EqualFunc(provider.requests[0].form, want, slices.Equal[[]string]) {
+		t.Fatalf("end session requests: %+v", provider.requests)
 	}
 
-	for name, tt := range map[string]struct {
-		change func(*testIdP)
+	for name, test := range map[string]struct {
+		change func(*testIdentityProvider)
 		hint   string
 	}{
-		"hint not accepted": {func(*testIdP) {}, "other-id-token"},
-		"server error":      {func(p *testIdP) { p.status = http.StatusServiceUnavailable }, ""},
-		"unreachable":       {func(p *testIdP) { p.down = true }, ""},
+		"hint not accepted": {func(*testIdentityProvider) {}, "other-id-token"},
+		"server error":      {func(provider *testIdentityProvider) { provider.status = http.StatusServiceUnavailable }, ""},
+		"unreachable":       {func(provider *testIdentityProvider) { provider.down = true }, ""},
 	} {
 		t.Run(name, func(t *testing.T) {
-			p, o := newIdP(t)
-			tt.change(p)
-			if err := o.endSession(context.Background(), cmp.Or(tt.hint, p.sign())); err == nil {
+			provider, client := newTestIdentityProvider(t)
+			test.change(provider)
+			if err := client.endSession(context.Background(), cmp.Or(test.hint, provider.signIDToken())); err == nil {
 				t.Fatal("no error")
 			}
 		})
@@ -300,26 +306,26 @@ func TestOIDCEndSession(t *testing.T) {
 }
 
 func TestOIDCLogoutURL(t *testing.T) {
-	o := newOIDC(issuer, "client", "secret", nil)
+	client := newOIDCClient(issuer, "client", "secret", nil)
 	redirect := "https://" + host + "/"
 	for idToken, want := range map[string]url.Values{
 		"id-token": {"id_token_hint": {"id-token"}, "client_id": {"client"}, "post_logout_redirect_uri": {redirect}},
 		"":         {"client_id": {"client"}, "post_logout_redirect_uri": {redirect}},
 	} {
-		u := must(url.Parse(o.logoutURL(idToken, redirect)))
-		if u.Scheme+"://"+u.Host+u.Path != issuer+"/api/oidc/end-session" || !maps.EqualFunc(u.Query(), want, slices.Equal[[]string]) {
-			t.Fatalf("ID token %q: %s", idToken, u)
+		location := must(url.Parse(client.logoutURL(idToken, redirect)))
+		if location.Scheme+"://"+location.Host+location.Path != issuer+"/api/oidc/end-session" || !maps.EqualFunc(location.Query(), want, slices.Equal[[]string]) {
+			t.Fatalf("ID token %q: %s", idToken, location)
 		}
 	}
 }
 
-func TestParseClaims(t *testing.T) {
-	c, err := parseClaims(fakeJWT(map[string]any{"sub": sub, "groups": []string{"a", "b"}, "auth_time": 42}))
-	if err != nil || c.Subject != sub || !slices.Equal(c.Groups, []string{"a", "b"}) || c.AuthTime != 42 {
-		t.Fatalf("%v %+v", err, c)
+func TestParseUnverifiedClaims(t *testing.T) {
+	user, err := parseUnverifiedClaims(fakeJWT(map[string]any{"sub": userID, "groups": []string{"a", "b"}, "auth_time": 42}))
+	if err != nil || user.Subject != userID || !slices.Equal(user.Groups, []string{"a", "b"}) || user.AuthenticatedAt != 42 {
+		t.Fatalf("%v %+v", err, user)
 	}
-	for _, idToken := range []string{"", "a.b", "a.%%%.c", "a." + base64.RawURLEncoding.EncodeToString([]byte("[]")) + ".c", "a.b.c.d", fakeJWT(map[string]any{"sub": sub, "auth_time": "yesterday"})} {
-		if _, err := parseClaims(idToken); err == nil {
+	for _, idToken := range []string{"", "a.b", "a.%%%.c", "a." + base64.RawURLEncoding.EncodeToString([]byte("[]")) + ".c", "a.b.c.d", fakeJWT(map[string]any{"sub": userID, "auth_time": "yesterday"})} {
+		if _, err := parseUnverifiedClaims(idToken); err == nil {
 			t.Fatalf("parsed %q", idToken)
 		}
 	}

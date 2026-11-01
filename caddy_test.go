@@ -11,14 +11,14 @@ import (
 )
 
 func TestUnmarshalCaddyfile(t *testing.T) {
-	var m Auth
-	err := m.UnmarshalCaddyfile(caddyfile.NewTestDispenser(`castelnuovo_auth {
+	var auth Auth
+	err := auth.UnmarshalCaddyfile(caddyfile.NewTestDispenser(`castelnuovo_auth {
 		client_id {env.CLIENT_ID}
 		client_secret secret
 		client_certificate off
 	}`))
-	if err != nil || m.ClientID != "{env.CLIENT_ID}" || m.ClientSecret != "secret" || !m.DisableClientCertificate {
-		t.Fatalf("%v %+v", err, &m)
+	if err != nil || auth.ClientID != "{env.CLIENT_ID}" || auth.ClientSecret != "secret" || !auth.DisableClientCertificate {
+		t.Fatalf("%v %+v", err, &auth)
 	}
 
 	for name, input := range map[string]string{
@@ -31,24 +31,24 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		"certificate without":    "castelnuovo_auth {\n client_certificate\n}",
 		"duplicate subdirective": "castelnuovo_auth {\n client_id a\n client_id b\n}",
 	} {
-		var m Auth
-		if err := m.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err == nil {
-			t.Fatalf("%s: accepted %+v", name, &m)
+		var auth Auth
+		if err := auth.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err == nil {
+			t.Fatalf("%s: accepted %+v", name, &auth)
 		}
 	}
 }
 
 func TestCaddyfileDirective(t *testing.T) {
-	out, _, err := caddyconfig.GetAdapter("caddyfile").Adapt([]byte(`app.castelnuovo.eu {
+	adaptedJSON, _, err := caddyconfig.GetAdapter("caddyfile").Adapt([]byte(`app.castelnuovo.eu {
 	respond ok
 	castelnuovo_auth {
 		client_id {env.CLIENT_ID}
 		client_secret {env.CLIENT_SECRET}
 	}
 }`), nil)
-	config := string(out)
-	auth, respond := strings.Index(config, `"handler":"castelnuovo_auth"`), strings.Index(config, `"handler":"static_response"`)
-	if err != nil || auth < 0 || respond < auth || !strings.Contains(config, `"client_id":"{env.CLIENT_ID}"`) {
+	config := string(adaptedJSON)
+	authPosition, respondPosition := strings.Index(config, `"handler":"castelnuovo_auth"`), strings.Index(config, `"handler":"static_response"`)
+	if err != nil || authPosition < 0 || respondPosition < authPosition || !strings.Contains(config, `"client_id":"{env.CLIENT_ID}"`) {
 		t.Fatalf("%v %s", err, config)
 	}
 }
@@ -61,29 +61,29 @@ func TestProvision(t *testing.T) {
 
 	provision := func(secret string) *Auth {
 		t.Helper()
-		m := &Auth{ClientID: "{env.TEST_CASTELNUOVO_CLIENT_ID}", ClientSecret: secret}
-		if err := m.Provision(ctx); err != nil || m.idp == nil || m.idp.(*oidcClient).http.Timeout == 0 {
-			t.Fatalf("%v %+v", err, m)
+		auth := &Auth{ClientID: "{env.TEST_CASTELNUOVO_CLIENT_ID}", ClientSecret: secret}
+		if err := auth.Provision(ctx); err != nil || auth.identityProvider == nil || auth.identityProvider.(*oidcClient).httpClient.Timeout == 0 {
+			t.Fatalf("%v %+v", err, auth)
 		}
-		return m
+		return auth
 	}
 	first := provision("{env.TEST_CASTELNUOVO_CLIENT_SECRET}")
-	c, err := first.seal(sessionCookie, session{Host: host}, 60)
+	cookie, err := first.sealCookie(sessionCookieName, session{Host: host}, 60)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	var s session
-	if err := provision("secret").open(sessionCookie, c.Value, &s); err != nil || s.Host != host {
+	var stored session
+	if err := provision("secret").openCookie(sessionCookieName, cookie.Value, &stored); err != nil || stored.Host != host {
 		t.Fatalf("after a restart: %v", err)
 	}
-	if err := provision("other secret").open(sessionCookie, c.Value, &s); err == nil {
+	if err := provision("other secret").openCookie(sessionCookieName, cookie.Value, &stored); err == nil {
 		t.Fatal("another client secret opened the cookie")
 	}
 
-	for _, m := range []*Auth{{ClientSecret: "secret"}, {ClientID: "client"}, {ClientID: "{env.TEST_CASTELNUOVO_MISSING}", ClientSecret: "secret"}} {
-		if err := m.Provision(ctx); err == nil {
-			t.Fatalf("provisioned %+v", m)
+	for _, auth := range []*Auth{{ClientSecret: "secret"}, {ClientID: "client"}, {ClientID: "{env.TEST_CASTELNUOVO_MISSING}", ClientSecret: "secret"}} {
+		if err := auth.Provision(ctx); err == nil {
+			t.Fatalf("provisioned %+v", auth)
 		}
 	}
 }

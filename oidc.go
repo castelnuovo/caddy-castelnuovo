@@ -20,51 +20,51 @@ const issuer = "https://id.castelnuovo.eu"
 var errUnavailable = errors.New("identity provider is unavailable")
 
 type pocketID interface {
-	authURL(redirectURL, state, nonce, verifier string) string
-	exchange(ctx context.Context, redirectURL, code, verifier string) (tokens, error)
-	refresh(ctx context.Context, refreshToken string) (tokens, error)
+	authorizationURL(redirectURL, state, nonce, codeVerifier string) string
+	exchangeCode(ctx context.Context, redirectURL, code, codeVerifier string) (tokenResponse, error)
+	refreshTokens(ctx context.Context, refreshToken string) (tokenResponse, error)
 	verifyIDToken(ctx context.Context, idToken string) (claims, error)
 	endSession(ctx context.Context, idToken string) error
 	logoutURL(idToken, redirectURL string) string
 }
 
-type tokens struct {
+type tokenResponse struct {
 	idToken, refreshToken string
 	claims                claims
 }
 
 type claims struct {
-	Subject           string   `json:"sub"`
-	PreferredUsername string   `json:"preferred_username"`
-	Name              string   `json:"name"`
-	Email             string   `json:"email"`
-	Groups            []string `json:"groups"`
-	AMR               []string `json:"amr"`
-	AuthTime          int64    `json:"auth_time"`
-	Nonce             string   `json:"nonce"`
+	Subject               string   `json:"sub"`
+	PreferredUsername     string   `json:"preferred_username"`
+	Name                  string   `json:"name"`
+	Email                 string   `json:"email"`
+	Groups                []string `json:"groups"`
+	AuthenticationMethods []string `json:"amr"`
+	AuthenticatedAt       int64    `json:"auth_time"`
+	Nonce                 string   `json:"nonce"`
 }
 
-func parseClaims(idToken string) (claims, error) {
-	var c claims
+func parseUnverifiedClaims(idToken string) (claims, error) {
+	var parsed claims
 	parts := strings.Split(idToken, ".")
 	if len(parts) != 3 {
-		return c, errors.New("ID token is malformed")
+		return parsed, errors.New("ID token is malformed")
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err == nil {
-		err = json.Unmarshal(payload, &c)
+		err = json.Unmarshal(payload, &parsed)
 	}
-	return c, err
+	return parsed, err
 }
 
 type oidcClient struct {
-	issuer   string
-	http     *http.Client
-	oauth    oauth2.Config
-	verifier *oidc.IDTokenVerifier
+	issuer          string
+	httpClient      *http.Client
+	oauthConfig     oauth2.Config
+	idTokenVerifier *oidc.IDTokenVerifier
 }
 
-func newOIDC(issuer, clientID, secret string, httpClient *http.Client) *oidcClient {
+func newOIDCClient(issuer, clientID, secret string, httpClient *http.Client) *oidcClient {
 	provider := (&oidc.ProviderConfig{
 		IssuerURL:  issuer,
 		AuthURL:    issuer + "/authorize",
@@ -75,106 +75,106 @@ func newOIDC(issuer, clientID, secret string, httpClient *http.Client) *oidcClie
 	endpoint := provider.Endpoint()
 	endpoint.AuthStyle = oauth2.AuthStyleInHeader
 	return &oidcClient{
-		issuer: issuer,
-		http:   httpClient,
-		oauth: oauth2.Config{
+		issuer:     issuer,
+		httpClient: httpClient,
+		oauthConfig: oauth2.Config{
 			ClientID:     clientID,
 			ClientSecret: secret,
 			Endpoint:     endpoint,
 			Scopes:       []string{oidc.ScopeOpenID, "profile", "email", "groups", oidc.ScopeOfflineAccess},
 		},
-		verifier: provider.Verifier(&oidc.Config{ClientID: clientID}),
+		idTokenVerifier: provider.Verifier(&oidc.Config{ClientID: clientID}),
 	}
 }
 
-func (o *oidcClient) authURL(redirectURL, state, nonce, verifier string) string {
-	cfg := o.oauth
-	cfg.RedirectURL = redirectURL
-	return cfg.AuthCodeURL(state,
+func (client *oidcClient) authorizationURL(redirectURL, state, nonce, codeVerifier string) string {
+	config := client.oauthConfig
+	config.RedirectURL = redirectURL
+	return config.AuthCodeURL(state,
 		oidc.Nonce(nonce),
-		oauth2.S256ChallengeOption(verifier),
-		oauth2.SetAuthURLParam("max_age", strconv.Itoa(int(maxAuthAge.Seconds()))),
+		oauth2.S256ChallengeOption(codeVerifier),
+		oauth2.SetAuthURLParam("max_age", strconv.Itoa(int(maxAuthenticationAge.Seconds()))),
 	)
 }
 
-func (o *oidcClient) exchange(ctx context.Context, redirectURL, code, verifier string) (tokens, error) {
-	cfg := o.oauth
-	cfg.RedirectURL = redirectURL
-	ctx = oidc.ClientContext(ctx, o.http)
-	token, err := cfg.Exchange(ctx, code, oauth2.VerifierOption(verifier))
+func (client *oidcClient) exchangeCode(ctx context.Context, redirectURL, code, codeVerifier string) (tokenResponse, error) {
+	config := client.oauthConfig
+	config.RedirectURL = redirectURL
+	ctx = oidc.ClientContext(ctx, client.httpClient)
+	token, err := config.Exchange(ctx, code, oauth2.VerifierOption(codeVerifier))
 	if err != nil {
-		return tokens{}, tokenError(err)
+		return tokenResponse{}, classifyTokenError(err)
 	}
-	return o.verify(ctx, token)
+	return client.verifyTokenResponse(ctx, token)
 }
 
-func (o *oidcClient) refresh(ctx context.Context, refreshToken string) (tokens, error) {
-	ctx = oidc.ClientContext(ctx, o.http)
-	token, err := o.oauth.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
+func (client *oidcClient) refreshTokens(ctx context.Context, refreshToken string) (tokenResponse, error) {
+	ctx = oidc.ClientContext(ctx, client.httpClient)
+	token, err := client.oauthConfig.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
 	if err != nil {
-		return tokens{}, tokenError(err)
+		return tokenResponse{}, classifyTokenError(err)
 	}
-	return o.verify(ctx, token)
+	return client.verifyTokenResponse(ctx, token)
 }
 
-func tokenError(err error) error {
-	if e, ok := errors.AsType[*oauth2.RetrieveError](err); ok && e.Response != nil && e.Response.StatusCode < 500 && e.Response.StatusCode != http.StatusTooManyRequests {
+func classifyTokenError(err error) error {
+	if retrieveError, ok := errors.AsType[*oauth2.RetrieveError](err); ok && retrieveError.Response != nil && retrieveError.Response.StatusCode < 500 && retrieveError.Response.StatusCode != http.StatusTooManyRequests {
 		return err
 	}
 	return fmt.Errorf("%w: %w", errUnavailable, err)
 }
 
-func (o *oidcClient) verify(ctx context.Context, token *oauth2.Token) (tokens, error) {
-	raw, _ := token.Extra("id_token").(string)
-	c, err := o.verifyIDToken(ctx, raw)
+func (client *oidcClient) verifyTokenResponse(ctx context.Context, token *oauth2.Token) (tokenResponse, error) {
+	rawIDToken, _ := token.Extra("id_token").(string)
+	verifiedClaims, err := client.verifyIDToken(ctx, rawIDToken)
 	switch {
 	case err != nil:
-		return tokens{}, err
+		return tokenResponse{}, err
 	case token.RefreshToken == "":
-		return tokens{}, errors.New("token response has no refresh_token")
+		return tokenResponse{}, errors.New("token response has no refresh_token")
 	}
-	return tokens{raw, token.RefreshToken, c}, nil
+	return tokenResponse{rawIDToken, token.RefreshToken, verifiedClaims}, nil
 }
 
-func (o *oidcClient) verifyIDToken(ctx context.Context, idToken string) (claims, error) {
-	var c claims
-	verified, err := o.verifier.Verify(oidc.ClientContext(ctx, o.http), idToken)
+func (client *oidcClient) verifyIDToken(ctx context.Context, idToken string) (claims, error) {
+	var verifiedClaims claims
+	parsedToken, err := client.idTokenVerifier.Verify(oidc.ClientContext(ctx, client.httpClient), idToken)
 	switch {
 	case err != nil && strings.Contains(err.Error(), "fetching keys"):
-		return c, fmt.Errorf("%w: %w", errUnavailable, err)
+		return verifiedClaims, fmt.Errorf("%w: %w", errUnavailable, err)
 	case err != nil:
-		return c, err
+		return verifiedClaims, err
 	}
-	return c, verified.Claims(&c)
+	return verifiedClaims, parsedToken.Claims(&verifiedClaims)
 }
 
-func (o *oidcClient) endSession(ctx context.Context, idToken string) error {
-	form := url.Values{"client_id": {o.oauth.ClientID}, "id_token_hint": {idToken}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.issuer+"/api/oidc/end-session", strings.NewReader(form.Encode()))
+func (client *oidcClient) endSession(ctx context.Context, idToken string) error {
+	form := url.Values{"client_id": {client.oauthConfig.ClientID}, "id_token_hint": {idToken}}
+	endSessionRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, client.issuer+"/api/oidc/end-session", strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	client := *o.http
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := client.Do(req)
+	endSessionRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	withoutRedirects := *client.httpClient
+	withoutRedirects.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := withoutRedirects.Do(endSessionRequest)
 	if err != nil {
 		return err
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") == o.issuer+"/logout" {
-		return fmt.Errorf("identity provider did not end the session: %s to %q", resp.Status, resp.Header.Get("Location"))
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusFound || response.Header.Get("Location") == client.issuer+"/logout" {
+		return fmt.Errorf("identity provider did not end the session: %s to %q", response.Status, response.Header.Get("Location"))
 	}
 	return nil
 }
 
-func (o *oidcClient) logoutURL(idToken, redirectURL string) string {
+func (client *oidcClient) logoutURL(idToken, redirectURL string) string {
 	query := url.Values{
-		"client_id":                {o.oauth.ClientID},
+		"client_id":                {client.oauthConfig.ClientID},
 		"post_logout_redirect_uri": {redirectURL},
 	}
 	if idToken != "" {
 		query.Set("id_token_hint", idToken)
 	}
-	return o.issuer + "/api/oidc/end-session?" + query.Encode()
+	return client.issuer + "/api/oidc/end-session?" + query.Encode()
 }

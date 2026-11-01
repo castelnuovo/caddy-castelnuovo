@@ -291,7 +291,7 @@ func cookieNamed(response *http.Response, name string) *http.Cookie {
 
 func pendingLoginCookie(response *http.Response) *http.Cookie {
 	for _, cookie := range response.Cookies() {
-		if strings.HasPrefix(cookie.Name, loginCookiePrefix) && cookie.MaxAge > 0 {
+		if cookie.Name == loginCookieName && cookie.MaxAge > 0 {
 			return cookie
 		}
 	}
@@ -342,7 +342,7 @@ func TestProtectedRequest(t *testing.T) {
 	auth, provider := newTestAuth(t)
 	session := logIn(t, auth, provider, userCertificate)
 
-	request := newHTTPRequest(http.MethodGet, "/page", userCertificate, session, &http.Cookie{Name: "app", Value: "kept"}, &http.Cookie{Name: loginCookiePrefix + "STATE", Value: "x"}, &http.Cookie{Name: "__Host-castelnuovo-app", Value: "kept"})
+	request := newHTTPRequest(http.MethodGet, "/page", userCertificate, session, &http.Cookie{Name: "app", Value: "kept"}, &http.Cookie{Name: loginCookieName, Value: "x"}, &http.Cookie{Name: "__Host-castelnuovo-app", Value: "kept"})
 	request.Header.Set("X-Auth-User", "spoofed")
 	request.Header.Set("X-Auth-Admin", "spoofed")
 	request.Header["X_Auth_Groups"] = []string{"spoofed"}
@@ -374,11 +374,11 @@ func TestProtectedRequest(t *testing.T) {
 
 func TestExtractOwnCookies(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
-	request.Header.Add("Cookie", "a=1; __Host-castelnuovo=old; "+loginCookiePrefix+"ONE=x")
-	request.Header.Add("Cookie", " b = 2 ;__Host-castelnuovo=new;; __Host-castelnuovo-app=3; "+loginCookiePrefix+"TWO=y")
-	session, logins := extractOwnCookies(request)
-	if session != "new" || len(logins) != 2 || logins["ONE"] != "x" || logins["TWO"] != "y" {
-		t.Fatalf("%q %v", session, logins)
+	request.Header.Add("Cookie", "a=1; __Host-castelnuovo=old; "+loginCookieName+"=x")
+	request.Header.Add("Cookie", " b = 2 ;__Host-castelnuovo=new;; __Host-castelnuovo-app=3")
+	session, login := extractOwnCookies(request)
+	if session != "new" || login != "x" {
+		t.Fatalf("%q %q", session, login)
 	}
 	if got := request.Header.Values("Cookie"); len(got) != 1 || got[0] != "a=1; b = 2; __Host-castelnuovo-app=3" {
 		t.Fatalf("kept %q", got)
@@ -811,7 +811,7 @@ func TestLogin(t *testing.T) {
 	login := pendingLoginCookie(response)
 	location := must(url.Parse(response.Header.Get("Location")))
 	query := location.Query()
-	if response.StatusCode != http.StatusFound || location.Scheme+"://"+location.Host+location.Path != issuer+"/authorize" || login == nil || login.Name != loginCookiePrefix+query.Get("state") || login.MaxAge != 600 {
+	if response.StatusCode != http.StatusFound || location.Scheme+"://"+location.Host+location.Path != issuer+"/authorize" || login == nil || login.MaxAge != 600 || query.Get("state") == "" {
 		t.Fatalf("login: %d %s %v", response.StatusCode, location, response.Cookies())
 	}
 	if query.Get("redirect_uri") != "https://"+host+callbackPath || query.Get("code_challenge_method") != "S256" || query.Get("max_age") != "3600" || query.Get("nonce") == "" || query.Has("prompt") {
@@ -825,38 +825,21 @@ func TestLogin(t *testing.T) {
 	}
 }
 
-func TestConcurrentLogins(t *testing.T) {
+func TestNewLoginReplacesPendingLogin(t *testing.T) {
 	auth, provider := newTestAuth(t)
-	first, second := get(t, auth, loginPath+"?rd=%2Ffirst", userCertificate), get(t, auth, loginPath+"?rd=%2Fsecond", userCertificate)
-	both := []*http.Cookie{pendingLoginCookie(first), pendingLoginCookie(second)}
-	for login, want := range map[*http.Response]string{second: "/second", first: "/first"} {
-		response := get(t, auth, provider.approveLogin(login.Header.Get("Location")), userCertificate, both...)
-		if response.StatusCode != http.StatusFound || response.Header.Get("Location") != want || cookieNamed(response, sessionCookieName) == nil {
-			t.Fatalf("%s: %d %s", want, response.StatusCode, response.Header.Get("Location"))
-		}
-	}
-}
-
-func TestPendingLoginsAreLimited(t *testing.T) {
-	auth, _ := newTestAuth(t)
-	var logins []*http.Cookie
-	for range maxPendingLogins {
-		response := get(t, auth, loginPath, userCertificate, logins...)
-		if len(response.Cookies()) != 1 {
-			t.Fatalf("login %d set %v", len(logins)+1, response.Cookies())
-		}
-		logins = append(logins, pendingLoginCookie(response))
+	first := get(t, auth, loginPath+"?rd=%2Ffirst", userCertificate)
+	second := get(t, auth, loginPath+"?rd=%2Fsecond", userCertificate, pendingLoginCookie(first))
+	if len(second.Cookies()) != 1 || pendingLoginCookie(second) == nil {
+		t.Fatalf("second login set %v", second.Cookies())
 	}
 
-	response := get(t, auth, loginPath, userCertificate, logins...)
-	expired := 0
-	for _, cookie := range response.Cookies() {
-		if cookie.MaxAge < 0 {
-			expired++
-		}
+	replaced := get(t, auth, provider.approveLogin(first.Header.Get("Location")), userCertificate, pendingLoginCookie(second))
+	if replaced.StatusCode != http.StatusBadRequest || len(replaced.Cookies()) != 0 {
+		t.Fatalf("first login: %d %v", replaced.StatusCode, replaced.Cookies())
 	}
-	if expired != maxPendingLogins || pendingLoginCookie(response) == nil {
-		t.Fatalf("login after %d pending logins set %v", maxPendingLogins, response.Cookies())
+	response := get(t, auth, provider.approveLogin(second.Header.Get("Location")), userCertificate, pendingLoginCookie(second))
+	if response.StatusCode != http.StatusFound || response.Header.Get("Location") != "/second" || cookieNamed(response, sessionCookieName) == nil {
+		t.Fatalf("second login: %d %s", response.StatusCode, response.Header.Get("Location"))
 	}
 }
 
@@ -892,14 +875,12 @@ func TestCallbackNeedsItsPendingLogin(t *testing.T) {
 	auth, provider := newTestAuth(t)
 	first, second := get(t, auth, loginPath, userCertificate), get(t, auth, loginPath, userCertificate)
 	callback := provider.approveLogin(first.Header.Get("Location"))
-	state := must(url.Parse(callback)).Query().Get("state")
 	tampered := *pendingLoginCookie(first)
 	tampered.Value = tamper(tampered.Value)
 
 	for name, cookies := range map[string][]*http.Cookie{
 		"another browser":       nil,
 		"another pending login": {pendingLoginCookie(second)},
-		"renamed login cookie":  {{Name: loginCookiePrefix + state, Value: pendingLoginCookie(second).Value}},
 		"tampered login cookie": {&tampered},
 	} {
 		if response := get(t, auth, callback, userCertificate, cookies...); response.StatusCode != http.StatusBadRequest || cookieNamed(response, sessionCookieName) != nil {
@@ -1090,7 +1071,7 @@ func TestSealedCookie(t *testing.T) {
 
 	for name, attempt := range map[string]func() error{
 		"tampered":     func() error { return auth.openCookie(sessionCookieName, tamper(cookie.Value), &stored) },
-		"another name": func() error { return auth.openCookie(loginCookiePrefix+"STATE", cookie.Value, &stored) },
+		"another name": func() error { return auth.openCookie(loginCookieName, cookie.Value, &stored) },
 		"another key": func() error {
 			return newAuthWithSecret(t, provider, "other secret").openCookie(sessionCookieName, cookie.Value, &stored)
 		},

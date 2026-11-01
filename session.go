@@ -42,8 +42,11 @@ func (m *Auth) authenticate(req *request) (*claims, error) {
 	case s.Host != req.r.Host || s.Certificate != req.cert:
 		req.log.Warn("session used from another host or certificate", zap.String("sub", c.Subject), zap.String("session_host", s.Host), zap.String("session_certificate", s.Certificate))
 		return nil, nil
-	case now-s.RefreshedAt < int64(refreshInterval.Seconds()) && m.idp.verifyIDToken(ctx, s.IDToken) == nil:
-		return &c, nil
+	}
+	if now-s.RefreshedAt < int64(refreshInterval.Seconds()) {
+		if verified, err := m.idp.verifyIDToken(ctx, s.IDToken); err == nil {
+			return &verified, nil
+		}
 	}
 
 	v, err, _ := m.refreshes.Do(s.RefreshToken, func() (any, error) {
@@ -64,14 +67,10 @@ func (m *Auth) authenticate(req *request) (*claims, error) {
 
 func (m *Auth) refresh(ctx context.Context, s session, sub string) (refreshed, error) {
 	t, err := m.idp.refresh(ctx, s.RefreshToken)
-	if err != nil {
-		return refreshed{}, err
-	}
-	c, err := parseClaims(t.idToken)
 	switch {
 	case err != nil:
 		return refreshed{}, err
-	case c.Subject != sub:
+	case t.claims.Subject != sub:
 		return refreshed{}, errors.New("refresh returned another user")
 	}
 	now := m.now().Unix()
@@ -80,5 +79,5 @@ func (m *Auth) refresh(ctx context.Context, s session, sub string) (refreshed, e
 	}
 	s.IDToken, s.RefreshToken, s.RefreshedAt = t.idToken, t.refreshToken, now
 	cookie, err := m.seal(sessionCookie, s, int(s.ExpiresAt-now))
-	return refreshed{cookie, c}, err
+	return refreshed{cookie, t.claims}, err
 }

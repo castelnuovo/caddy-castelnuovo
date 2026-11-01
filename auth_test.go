@@ -60,15 +60,16 @@ type fakePocketID struct {
 	clock     atomic.Int64
 	onRefresh func()
 
-	mu        sync.Mutex
-	user      claims
-	down      bool
-	disabled  bool
-	refreshes int
-	codes     map[string]authorization
-	tokens    map[string]*issuedToken
-	hints     map[string]*grant
-	idTokens  map[string]time.Time
+	mu          sync.Mutex
+	user        claims
+	down        bool
+	disabled    bool
+	refreshes   int
+	endSessions int
+	codes       map[string]authorization
+	tokens      map[string]*issuedToken
+	hints       map[string]*grant
+	idTokens    map[string]time.Time
 }
 
 func (f *fakePocketID) now() time.Time {
@@ -167,30 +168,36 @@ func (f *fakePocketID) issue(g *grant, nonce string) tokens {
 			"rt":   (rand.Text() + rand.Text())[:40],
 		}),
 	}
+	t.claims = must(parseClaims(t.idToken))
 	f.tokens[t.refreshToken] = &issuedToken{grant: g}
 	f.hints[t.idToken] = g
 	f.idTokens[t.idToken] = now.Add(time.Hour)
 	return t
 }
 
-func (f *fakePocketID) verifyIDToken(_ context.Context, idToken string) error {
+func (f *fakePocketID) verifyIDToken(_ context.Context, idToken string) (claims, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	switch expiry, ok := f.idTokens[idToken]; {
 	case !ok:
-		return errors.New("ID token was not signed by the identity provider")
+		return claims{}, errors.New("ID token was not signed by the identity provider")
 	case !f.now().Before(expiry):
-		return errors.New("ID token is expired")
+		return claims{}, errors.New("ID token is expired")
 	}
-	return nil
+	return parseClaims(idToken)
 }
 
-func (f *fakePocketID) endSession(location string) {
+func (f *fakePocketID) endSession(_ context.Context, idToken string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if g, ok := f.hints[must(url.Parse(location)).Query().Get("id_token_hint")]; ok {
+	f.endSessions++
+	if f.down {
+		return errUnavailable
+	}
+	if g, ok := f.hints[idToken]; ok {
 		g.revoked = true
 	}
+	return nil
 }
 
 func fakeJWT(claims map[string]any) string {

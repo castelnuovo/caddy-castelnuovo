@@ -50,6 +50,8 @@ func (p *testIdP) RoundTrip(r *http.Request) (*http.Response, error) {
 		p.jwks(rec)
 	case testIssuer + "/api/oidc/token":
 		p.token(rec, r)
+	case testIssuer + "/api/oidc/end-session":
+		p.endSession(rec, r)
 	default:
 		rec.WriteHeader(http.StatusNotFound)
 	}
@@ -90,6 +92,19 @@ func (p *testIdP) token(w http.ResponseWriter, r *http.Request) {
 	}
 	delete(response, p.omit)
 	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (p *testIdP) endSession(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	p.requests = append(p.requests, tokenRequest{form: r.PostForm})
+	switch {
+	case p.status != 0:
+		w.WriteHeader(p.status)
+	case r.PostForm.Get("id_token_hint") != p.sign():
+		http.Redirect(w, r, testIssuer+"/logout", http.StatusFound)
+	default:
+		http.Redirect(w, r, "https://"+host+"/", http.StatusFound)
+	}
 }
 
 func (p *testIdP) sign() string {
@@ -142,8 +157,8 @@ func TestOIDCAuthURL(t *testing.T) {
 func TestOIDCExchange(t *testing.T) {
 	p, o := newIdP(t)
 	got, err := o.exchange(context.Background(), "https://"+host+callbackPath, "code", "verifier")
-	c, _ := parseClaims(got.idToken)
-	if err != nil || got.refreshToken != "new-refresh-token" || c.Subject != sub || c.Nonce != "nonce" || !slices.Equal(c.AMR, []string{"phr"}) || !slices.Equal(c.Groups, []string{"admins"}) {
+	c := got.claims
+	if err != nil || got.idToken != p.sign() || got.refreshToken != "new-refresh-token" || c.Subject != sub || c.Nonce != "nonce" || !slices.Equal(c.AMR, []string{"phr"}) || !slices.Equal(c.Groups, []string{"admins"}) {
 		t.Fatalf("%v %+v %+v", err, got, c)
 	}
 
@@ -175,6 +190,7 @@ func TestOIDCExchangeFails(t *testing.T) {
 		"expired ID token": {func(p *testIdP) { p.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, 1, false},
 		"another signer":   {func(p *testIdP) { p.signer = must(rsa.GenerateKey(rand.Reader, 2048)) }, 1, false},
 		"keys unavailable": {func(p *testIdP) { p.jwksStatus = http.StatusServiceUnavailable }, 1, true},
+		"malformed claims": {func(p *testIdP) { p.claims["auth_time"] = "yesterday" }, 1, false},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -191,7 +207,7 @@ func TestOIDCExchangeFails(t *testing.T) {
 func TestOIDCRefresh(t *testing.T) {
 	p, o := newIdP(t)
 	got, err := o.refresh(context.Background(), "old-refresh-token")
-	if c, _ := parseClaims(got.idToken); err != nil || c.Subject != sub || got.refreshToken != "new-refresh-token" {
+	if err != nil || got.claims.Subject != sub || got.idToken != p.sign() || got.refreshToken != "new-refresh-token" {
 		t.Fatalf("%v %+v", err, got)
 	}
 	want := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"old-refresh-token"}}
@@ -244,9 +260,40 @@ func TestOIDCVerifyIDToken(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			p, o := newIdP(t)
 			tt.change(p)
-			err := o.verifyIDToken(context.Background(), p.sign())
+			c, err := o.verifyIDToken(context.Background(), p.sign())
 			if (err == nil) != tt.valid || errors.Is(err, errUnavailable) != tt.unavailable || len(p.requests) != 0 {
 				t.Fatalf("error %v after %d token requests", err, len(p.requests))
+			}
+			if tt.valid && (c.Subject != sub || !slices.Equal(c.Groups, []string{"admins"})) {
+				t.Fatalf("claims %+v", c)
+			}
+		})
+	}
+}
+
+func TestOIDCEndSession(t *testing.T) {
+	p, o := newIdP(t)
+	if err := o.endSession(context.Background(), p.sign()); err != nil {
+		t.Fatal(err)
+	}
+	want := url.Values{"client_id": {"client"}, "id_token_hint": {p.sign()}}
+	if len(p.requests) != 1 || !maps.EqualFunc(p.requests[0].form, want, slices.Equal[[]string]) {
+		t.Fatalf("end session requests: %+v", p.requests)
+	}
+
+	for name, tt := range map[string]struct {
+		change func(*testIdP)
+		hint   string
+	}{
+		"hint not accepted": {func(*testIdP) {}, "other-id-token"},
+		"server error":      {func(p *testIdP) { p.status = http.StatusServiceUnavailable }, ""},
+		"unreachable":       {func(p *testIdP) { p.down = true }, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, o := newIdP(t)
+			tt.change(p)
+			if err := o.endSession(context.Background(), cmp.Or(tt.hint, p.sign())); err == nil {
+				t.Fatal("no error")
 			}
 		})
 	}

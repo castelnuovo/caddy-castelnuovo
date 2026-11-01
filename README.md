@@ -98,7 +98,7 @@ To log out, post a form to the logout endpoint:
 
 This also ends the login at `id.castelnuovo.eu` and then returns to `https://<host>/`. Only a POST from the site itself works, so other sites cannot log you out.
 
-A copy of the session cookie keeps working after logout until its next refresh, so for at most 5 minutes.
+The handler ends the login at `id.castelnuovo.eu` itself before the redirect, so a copy of the session cookie stops working at its next refresh, at most 5 minutes later. If `id.castelnuovo.eu` cannot be reached during the logout, the handler logs a warning, and a copy keeps working until the session expires.
 
 ### OIDC client
 

@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestLogin(t *testing.T) {
@@ -233,12 +236,17 @@ func TestLogout(t *testing.T) {
 	if c, err := parseClaims(hint); err != nil || c.Subject != sub {
 		t.Fatalf("hint is not the ID token: %v %+v", err, c)
 	}
+	if idp.endSessions != 1 {
+		t.Fatalf("ended %d sessions at the identity provider", idp.endSessions)
+	}
 }
 
 func TestLogoutEndsLoginAtIdentityProvider(t *testing.T) {
 	m, idp := newTest(t)
 	session := logIn(t, m, idp, cert)
-	idp.endSession(serve(t, m, httpRequest(http.MethodPost, logoutPath, cert, session)).Header.Get("Location"))
+	if resp := serve(t, m, httpRequest(http.MethodPost, logoutPath, cert, session)); resp.StatusCode != http.StatusSeeOther || idp.endSessions != 1 {
+		t.Fatalf("logout: %d, %d sessions ended", resp.StatusCode, idp.endSessions)
+	}
 
 	idp.advance(refreshInterval - time.Second)
 	if resp := get(t, m, "/page", cert, session); resp.StatusCode != http.StatusOK {
@@ -248,5 +256,27 @@ func TestLogoutEndsLoginAtIdentityProvider(t *testing.T) {
 	resp := get(t, m, "/page", cert, session)
 	if expired := cookieNamed(resp, sessionCookie); resp.StatusCode != http.StatusFound || expired == nil || expired.MaxAge >= 0 {
 		t.Fatalf("copied cookie at its next refresh: %d %v", resp.StatusCode, resp.Cookies())
+	}
+}
+
+func TestLogoutWhileIdentityProviderIsDown(t *testing.T) {
+	m, idp := newTest(t)
+	core, logs := observer.New(zap.InfoLevel)
+	m.log = zap.New(core)
+	session := logIn(t, m, idp, cert)
+
+	idp.down = true
+	resp := serve(t, m, httpRequest(http.MethodPost, logoutPath, cert, session))
+	if expired := cookieNamed(resp, sessionCookie); resp.StatusCode != http.StatusSeeOther || expired == nil || expired.MaxAge >= 0 {
+		t.Fatalf("logout: %d %v", resp.StatusCode, resp.Cookies())
+	}
+	if entries := logs.FilterMessage("logout did not end the login at the identity provider").All(); len(entries) != 1 || entries[0].ContextMap()["sub"] != sub {
+		t.Fatalf("logs: %v", logs.All())
+	}
+
+	idp.down = false
+	idp.advance(refreshInterval)
+	if resp := get(t, m, "/page", cert, session); resp.StatusCode != http.StatusOK {
+		t.Fatalf("copied cookie after the outage: %d", resp.StatusCode)
 	}
 }

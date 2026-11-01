@@ -1,6 +1,7 @@
 package castelnuovo
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"net/http"
@@ -72,11 +73,8 @@ func (m *Auth) callback(req *request) error {
 	case err != nil:
 		return req.deny(http.StatusForbidden, err)
 	}
-	c, err := parseClaims(t.idToken)
-	if err == nil {
-		err = m.checkLogin(c, l.Nonce, req.cert)
-	}
-	if err != nil {
+	c := t.claims
+	if err := m.checkLogin(c, l.Nonce, req.cert); err != nil {
 		return req.deny(http.StatusForbidden, err, zap.String("sub", c.Subject))
 	}
 
@@ -129,6 +127,9 @@ func (m *Auth) logout(req *request) error {
 	var s session
 	if m.open(sessionCookie, req.session, &s) == nil {
 		c, _ := parseClaims(s.IDToken)
+		if err := m.idp.endSession(context.WithoutCancel(req.r.Context()), s.IDToken); err != nil {
+			req.log.Warn("logout did not end the login at the identity provider", zap.String("sub", c.Subject), zap.Error(err))
+		}
 		req.log.Info("user logged out", zap.String("sub", c.Subject))
 	}
 	http.Redirect(req.w, req.r, m.idp.logoutURL(s.IDToken, "https://"+req.r.Host+"/"), http.StatusSeeOther)

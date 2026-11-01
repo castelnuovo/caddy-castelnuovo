@@ -23,12 +23,14 @@ type pocketID interface {
 	authURL(redirectURL, state, nonce, verifier string) string
 	exchange(ctx context.Context, redirectURL, code, verifier string) (tokens, error)
 	refresh(ctx context.Context, refreshToken string) (tokens, error)
-	verifyIDToken(ctx context.Context, idToken string) error
+	verifyIDToken(ctx context.Context, idToken string) (claims, error)
+	endSession(ctx context.Context, idToken string) error
 	logoutURL(idToken, redirectURL string) string
 }
 
 type tokens struct {
 	idToken, refreshToken string
+	claims                claims
 }
 
 type claims struct {
@@ -124,21 +126,46 @@ func tokenError(err error) error {
 
 func (o *oidcClient) verify(ctx context.Context, token *oauth2.Token) (tokens, error) {
 	raw, _ := token.Extra("id_token").(string)
-	if err := o.verifyIDToken(ctx, raw); err != nil {
+	c, err := o.verifyIDToken(ctx, raw)
+	switch {
+	case err != nil:
 		return tokens{}, err
-	}
-	if token.RefreshToken == "" {
+	case token.RefreshToken == "":
 		return tokens{}, errors.New("token response has no refresh_token")
 	}
-	return tokens{raw, token.RefreshToken}, nil
+	return tokens{raw, token.RefreshToken, c}, nil
 }
 
-func (o *oidcClient) verifyIDToken(ctx context.Context, idToken string) error {
-	_, err := o.verifier.Verify(oidc.ClientContext(ctx, o.http), idToken)
-	if err != nil && strings.Contains(err.Error(), "fetching keys") {
-		return fmt.Errorf("%w: %w", errUnavailable, err)
+func (o *oidcClient) verifyIDToken(ctx context.Context, idToken string) (claims, error) {
+	var c claims
+	verified, err := o.verifier.Verify(oidc.ClientContext(ctx, o.http), idToken)
+	switch {
+	case err != nil && strings.Contains(err.Error(), "fetching keys"):
+		return c, fmt.Errorf("%w: %w", errUnavailable, err)
+	case err != nil:
+		return c, err
 	}
-	return err
+	return c, verified.Claims(&c)
+}
+
+func (o *oidcClient) endSession(ctx context.Context, idToken string) error {
+	form := url.Values{"client_id": {o.oauth.ClientID}, "id_token_hint": {idToken}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.issuer+"/api/oidc/end-session", strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	client := *o.http
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") == o.issuer+"/logout" {
+		return fmt.Errorf("identity provider did not end the session: %s to %q", resp.Status, resp.Header.Get("Location"))
+	}
+	return nil
 }
 
 func (o *oidcClient) logoutURL(idToken, redirectURL string) string {

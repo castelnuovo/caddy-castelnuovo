@@ -28,7 +28,7 @@ xcaddy build --with github.com/castelnuovo/caddy-castelnuovo
 
 ## castelnuovo_auth
 
-Protects a site with a login at `https://id.castelnuovo.eu`, which must run Pocket ID v2.19.0 or later. Without `client_certificate off`, the site also needs a client certificate.
+Protects a site with a login at `https://id.castelnuovo.eu`. Without `client_certificate off`, the site also needs a client certificate.
 
 ```caddyfile
 {
@@ -82,11 +82,11 @@ Requests that reach the app carry these headers. The handler first removes every
 
 ### Sessions
 
-A session lives in an encrypted cookie, so it survives restarts and reloads of Caddy. The key comes from the client secret, so changing the secret logs everyone out. The ID token in the cookie is also checked against the keys of `id.castelnuovo.eu` on every request, so the client secret alone is not enough to create a session. A session lasts 12 hours and only works on the host and with the client certificate it started with.
+Sessions live in memory, and the session cookie only holds a random ID. A config reload keeps sessions as long as `client_id` stays the same, and a restart of Caddy logs everyone out. A session lasts 12 hours and only works on the host and with the client certificate it started with.
 
 Every 5 minutes the handler refreshes the session at `id.castelnuovo.eu`. This picks up changes to the user's name, email and groups, and ends the session of a disabled user. While a refresh is due and `id.castelnuovo.eu` cannot be reached, requests get status 502.
 
-A request without a session is redirected to the login when it loads a page, and gets status 401 otherwise. The cookie has to stay under 4096 bytes, which leaves room for about 35 groups with names of 16 characters. A user with more groups cannot log in.
+A request without a session is redirected to the login when it loads a page, and gets status 401 otherwise. A browser has one login in progress at a time. Starting another one, for example in a second tab, replaces it, so finishing the first one gets status 400 until the page is reloaded.
 
 ### Logout
 
@@ -98,7 +98,7 @@ To log out, post a form to the logout endpoint:
 
 This also ends the login at `id.castelnuovo.eu` and then returns to `https://<host>/`. Only a POST from the site itself works, so other sites cannot log you out.
 
-The handler ends the login at `id.castelnuovo.eu` itself before the redirect, so a copy of the session cookie stops working at its next refresh, at most 5 minutes later. If `id.castelnuovo.eu` cannot be reached during the logout, the handler logs a warning, and a copy keeps working until the session expires.
+Logging out ends the session right away, so a copy of the session cookie stops working too.
 
 ### OIDC client
 

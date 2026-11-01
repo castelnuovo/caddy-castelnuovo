@@ -2,8 +2,6 @@ package castelnuovo
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -22,9 +20,7 @@ var errUnavailable = errors.New("identity provider is unavailable")
 type pocketID interface {
 	authorizationURL(redirectURL, state, nonce, codeVerifier string) string
 	exchangeCode(ctx context.Context, redirectURL, code, codeVerifier string) (tokenResponse, error)
-	verifyIDToken(ctx context.Context, idToken string) (claims, error)
 	refreshTokens(ctx context.Context, refreshToken string) (tokenResponse, error)
-	endSession(ctx context.Context, idToken string) error
 	logoutURL(idToken, redirectURL string) string
 }
 
@@ -42,19 +38,6 @@ type claims struct {
 	AuthenticationMethods []string `json:"amr"`
 	AuthenticatedAt       int64    `json:"auth_time"`
 	Nonce                 string   `json:"nonce"`
-}
-
-func parseUnverifiedClaims(idToken string) (claims, error) {
-	var parsed claims
-	parts := strings.Split(idToken, ".")
-	if len(parts) != 3 {
-		return parsed, errors.New("ID token is malformed")
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err == nil {
-		err = json.Unmarshal(payload, &parsed)
-	}
-	return parsed, err
 }
 
 type oidcClient struct {
@@ -117,26 +100,20 @@ func classifyTokenError(err error) error {
 
 func (client *oidcClient) verifyTokenResponse(ctx context.Context, token *oauth2.Token) (tokenResponse, error) {
 	rawIDToken, _ := token.Extra("id_token").(string)
-	verifiedClaims, err := client.verifyIDToken(ctx, rawIDToken)
+	idToken, err := client.idTokenVerifier.Verify(oidc.ClientContext(ctx, client.httpClient), rawIDToken)
 	switch {
+	case err != nil && strings.Contains(err.Error(), "fetching keys"):
+		return tokenResponse{}, fmt.Errorf("%w: %w", errUnavailable, err)
 	case err != nil:
 		return tokenResponse{}, err
 	case token.RefreshToken == "":
 		return tokenResponse{}, errors.New("token response has no refresh_token")
 	}
-	return tokenResponse{rawIDToken, token.RefreshToken, verifiedClaims}, nil
-}
-
-func (client *oidcClient) verifyIDToken(ctx context.Context, idToken string) (claims, error) {
 	var verifiedClaims claims
-	parsedToken, err := client.idTokenVerifier.Verify(oidc.ClientContext(ctx, client.httpClient), idToken)
-	switch {
-	case err != nil && strings.Contains(err.Error(), "fetching keys"):
-		return verifiedClaims, fmt.Errorf("%w: %w", errUnavailable, err)
-	case err != nil:
-		return verifiedClaims, err
+	if err := idToken.Claims(&verifiedClaims); err != nil {
+		return tokenResponse{}, err
 	}
-	return verifiedClaims, parsedToken.Claims(&verifiedClaims)
+	return tokenResponse{rawIDToken, token.RefreshToken, verifiedClaims}, nil
 }
 
 func (client *oidcClient) refreshTokens(ctx context.Context, refreshToken string) (tokenResponse, error) {
@@ -146,26 +123,6 @@ func (client *oidcClient) refreshTokens(ctx context.Context, refreshToken string
 		return tokenResponse{}, classifyTokenError(err)
 	}
 	return client.verifyTokenResponse(ctx, token)
-}
-
-func (client *oidcClient) endSession(ctx context.Context, idToken string) error {
-	form := url.Values{"client_id": {client.oauthConfig.ClientID}, "id_token_hint": {idToken}}
-	endSessionRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, client.issuer+"/api/oidc/end-session", strings.NewReader(form.Encode()))
-	if err != nil {
-		return err
-	}
-	endSessionRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	withoutRedirects := *client.httpClient
-	withoutRedirects.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	response, err := withoutRedirects.Do(endSessionRequest)
-	if err != nil {
-		return err
-	}
-	_ = response.Body.Close()
-	if response.StatusCode != http.StatusFound || response.Header.Get("Location") == client.issuer+"/logout" {
-		return fmt.Errorf("identity provider did not end the session: %s to %q", response.Status, response.Header.Get("Location"))
-	}
-	return nil
 }
 
 func (client *oidcClient) logoutURL(idToken, redirectURL string) string {

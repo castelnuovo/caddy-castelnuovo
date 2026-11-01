@@ -5,8 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -52,8 +50,8 @@ type authorization struct {
 }
 
 type issuedToken struct {
-	grant     *grant
-	rotatedAt time.Time
+	grant *grant
+	used  bool
 }
 
 type fakePocketID struct {
@@ -66,11 +64,9 @@ type fakePocketID struct {
 	down                bool
 	disabled            bool
 	refreshes           int
-	endSessions         int
+	lastIDToken         string
 	codes               map[string]authorization
 	issuedRefreshTokens map[string]*issuedToken
-	grantsByIDToken     map[string]*grant
-	idTokenExpiry       map[string]time.Time
 }
 
 func (fake *fakePocketID) now() time.Time {
@@ -105,63 +101,17 @@ func (fake *fakePocketID) exchangeCode(_ context.Context, redirectURL, code, ver
 }
 
 func (fake *fakePocketID) issueTokens(issuedGrant *grant, nonce string) tokenResponse {
-	now, user := fake.now(), fake.user
+	user := fake.user
 	if user.Nonce == "" {
 		user.Nonce = nonce
 	}
 	if user.AuthenticatedAt == 0 {
 		user.AuthenticatedAt = issuedGrant.authenticatedAt
 	}
-	idClaims := map[string]any{
-		"iss":                issuer,
-		"aud":                clientID,
-		"sub":                user.Subject,
-		"exp":                now.Add(time.Hour).Unix(),
-		"iat":                now.Unix(),
-		"type":               "id-token",
-		"auth_time":          user.AuthenticatedAt,
-		"amr":                user.AuthenticationMethods,
-		"email":              user.Email,
-		"email_verified":     true,
-		"name":               user.Name,
-		"given_name":         "Luca",
-		"family_name":        "Castelnuovo",
-		"preferred_username": user.PreferredUsername,
-		"picture":            issuer + "/api/users/" + user.Subject + "/profile-picture.png",
-		"groups":             user.Groups,
-	}
-	if user.Nonce != "" {
-		idClaims["nonce"] = user.Nonce
-	}
-	issued := tokenResponse{
-		idToken: fakeJWT(idClaims),
-		refreshToken: fakeJWT(map[string]any{
-			"iss":  issuer,
-			"aud":  clientID,
-			"sub":  user.Subject,
-			"exp":  now.Add(30 * 24 * time.Hour).Unix(),
-			"iat":  now.Unix(),
-			"type": "oauth-refresh-token",
-			"rt":   (rand.Text() + rand.Text())[:40],
-		}),
-	}
-	issued.claims = must(parseUnverifiedClaims(issued.idToken))
+	issued := tokenResponse{idToken: "id-token-" + rand.Text(), refreshToken: "refresh-token-" + rand.Text(), claims: user}
 	fake.issuedRefreshTokens[issued.refreshToken] = &issuedToken{grant: issuedGrant}
-	fake.grantsByIDToken[issued.idToken] = issuedGrant
-	fake.idTokenExpiry[issued.idToken] = now.Add(time.Hour)
+	fake.lastIDToken = issued.idToken
 	return issued
-}
-
-func (fake *fakePocketID) verifyIDToken(_ context.Context, idToken string) (claims, error) {
-	fake.mutex.Lock()
-	defer fake.mutex.Unlock()
-	switch expiry, ok := fake.idTokenExpiry[idToken]; {
-	case !ok:
-		return claims{}, errors.New("ID token was not signed by the identity provider")
-	case !fake.now().Before(expiry):
-		return claims{}, errors.New("ID token is expired")
-	}
-	return parseUnverifiedClaims(idToken)
 }
 
 func (fake *fakePocketID) refreshTokens(ctx context.Context, refreshToken string) (tokenResponse, error) {
@@ -179,34 +129,12 @@ func (fake *fakePocketID) refreshTokens(ctx context.Context, refreshToken string
 		return tokenResponse{}, errUnavailable
 	case !ok || issued.grant.revoked || fake.disabled:
 		return tokenResponse{}, errInvalidGrant
-	case issued.rotatedAt.IsZero():
-		issued.rotatedAt = fake.now()
-	case fake.now().Sub(issued.rotatedAt) > time.Minute:
+	case issued.used:
 		issued.grant.revoked = true
 		return tokenResponse{}, errInvalidGrant
 	}
+	issued.used = true
 	return fake.issueTokens(issued.grant, ""), nil
-}
-
-func (fake *fakePocketID) endSession(_ context.Context, idToken string) error {
-	fake.mutex.Lock()
-	defer fake.mutex.Unlock()
-	fake.endSessions++
-	if fake.down {
-		return errUnavailable
-	}
-	if issuedGrant, ok := fake.grantsByIDToken[idToken]; ok {
-		issuedGrant.revoked = true
-	}
-	return nil
-}
-
-func fakeJWT(claims map[string]any) string {
-	payload, _ := json.Marshal(claims)
-	signature := make([]byte, 256)
-	_, _ = rand.Read(signature)
-	encode := base64.RawURLEncoding.EncodeToString
-	return encode([]byte(`{"alg":"RS256","kid":"3Ai6Wu_fJGPGTJp2ngs1qcXnWxNl0xr9s0yGfO4dLzI","typ":"JWT"}`)) + "." + encode(payload) + "." + encode(signature)
 }
 
 func newTestAuth(t *testing.T) (*Auth, *fakePocketID) {
@@ -222,19 +150,9 @@ func newTestAuth(t *testing.T) (*Auth, *fakePocketID) {
 		},
 		codes:               map[string]authorization{},
 		issuedRefreshTokens: map[string]*issuedToken{},
-		grantsByIDToken:     map[string]*grant{},
-		idTokenExpiry:       map[string]time.Time{},
 	}
 	provider.clock.Store(time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC).UnixNano())
-	return newAuthWithSecret(t, provider, "secret"), provider
-}
-
-func newAuthWithSecret(t *testing.T, provider *fakePocketID, secret string) *Auth {
-	cookieCipher, err := newCookieCipher(secret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &Auth{cookieCipher: cookieCipher, identityProvider: provider, now: provider.now, log: zap.NewNop()}
+	return &Auth{sessions: newSessionStore(), identityProvider: provider, now: provider.now, log: zap.NewNop()}, provider
 }
 
 func newHTTPRequest(method, target, uri string, cookies ...*http.Cookie) *http.Request {
@@ -311,14 +229,6 @@ func logIn(t *testing.T, auth *Auth, provider *fakePocketID, uri string) *http.C
 func completeLoginAtProvider(t *testing.T, auth *Auth, provider *fakePocketID, login *http.Response, uri string, cookies ...*http.Cookie) *http.Response {
 	t.Helper()
 	return get(t, auth, provider.approveLogin(login.Header.Get("Location")), uri, append(cookies, pendingLoginCookie(login))...)
-}
-
-func groupNames(count int) []string {
-	names := make([]string, count)
-	for index := range names {
-		names[index] = fmt.Sprintf("group-name-%05d", index)
-	}
-	return names
 }
 
 func tamper(value string) string {
@@ -429,8 +339,8 @@ func TestWithoutCertificate(t *testing.T) {
 		t.Fatalf("certificate is ignored: %d", response.StatusCode)
 	}
 
-	strict := newAuthWithSecret(t, provider, "secret")
-	if response := get(t, strict, "/page", userCertificate, session); response.StatusCode != http.StatusFound {
+	auth.DisableClientCertificate = false
+	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusFound {
 		t.Fatalf("site that requires a certificate: %d", response.StatusCode)
 	}
 }
@@ -490,82 +400,11 @@ func TestSessionBinding(t *testing.T) {
 			t.Fatalf("%s: %d", name, response.StatusCode)
 		}
 	}
+	if response := get(t, auth, "/page", userCertificate, &http.Cookie{Name: sessionCookieName, Value: "unknown"}); response.StatusCode != http.StatusFound {
+		t.Fatalf("unknown session: %d", response.StatusCode)
+	}
 	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusOK {
 		t.Fatalf("own host and certificate: %d", response.StatusCode)
-	}
-}
-
-func TestRejectsInvalidSessionCookies(t *testing.T) {
-	auth, provider := newTestAuth(t)
-	valid := logIn(t, auth, provider, userCertificate)
-	login := pendingLoginCookie(get(t, auth, loginPath, userCertificate))
-	other := newAuthWithSecret(t, provider, "other secret")
-
-	var stored session
-	if err := auth.openCookie(sessionCookieName, valid.Value, &stored); err != nil {
-		t.Fatal(err)
-	}
-	stored.ExpiresAt = provider.now().Unix()
-	expired, err := auth.sealCookie(sessionCookieName, stored, 60)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for name, value := range map[string]string{
-		"tampered":                tamper(valid.Value),
-		"truncated":               valid.Value[:len(valid.Value)-1],
-		"not base64":              "%%%",
-		"too short":               "AAAA",
-		"sealed with another key": logIn(t, other, provider, userCertificate).Value,
-		"login cookie":            login.Value,
-		"expired payload":         expired.Value,
-	} {
-		if response := get(t, auth, "/page", userCertificate, &http.Cookie{Name: sessionCookieName, Value: value}); response.StatusCode != http.StatusFound || response.Header.Get("X-Auth-Sub") != "" {
-			t.Fatalf("%s: %d", name, response.StatusCode)
-		}
-	}
-	if provider.refreshes != 0 {
-		t.Fatalf("%d refreshes", provider.refreshes)
-	}
-}
-
-func TestSessionNeedsSignedIDToken(t *testing.T) {
-	unsigned := func(fake *fakePocketID, subject string) string {
-		return fakeJWT(map[string]any{"iss": issuer, "aud": clientID, "sub": subject, "exp": fake.now().Add(time.Hour).Unix(), "amr": []string{"phr"}, "groups": []string{"admins", "users", "root"}})
-	}
-	tests := map[string]struct {
-		change func(*session, *fakePocketID)
-		status int
-	}{
-		"unsigned ID token": {func(stored *session, fake *fakePocketID) {
-			stored.IDToken, stored.RefreshToken = unsigned(fake, userID), "forged"
-		}, http.StatusFound},
-		"unsigned ID token of another user":            {func(stored *session, fake *fakePocketID) { stored.IDToken = unsigned(fake, otherUserID) }, http.StatusFound},
-		"unsigned ID token while the provider is down": {func(stored *session, fake *fakePocketID) { stored.IDToken, fake.down = unsigned(fake, userID), true }, http.StatusBadGateway},
-		"expired ID token":                             {func(_ *session, fake *fakePocketID) { fake.advance(time.Hour) }, http.StatusOK},
-	}
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			auth, provider := newTestAuth(t)
-			var stored session
-			if err := auth.openCookie(sessionCookieName, logIn(t, auth, provider, userCertificate).Value, &stored); err != nil {
-				t.Fatal(err)
-			}
-			test.change(&stored, provider)
-			stored.RefreshedAt = provider.now().Unix()
-			forged, err := auth.sealCookie(sessionCookieName, stored, 60)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			response := get(t, auth, "/page", userCertificate, forged)
-			if response.StatusCode != test.status || provider.refreshes != 1 || response.Header.Get("X-Auth-Groups") == "admins,users,root" {
-				t.Fatalf("%d %q, %d refreshes", response.StatusCode, response.Header.Get("X-Auth-Groups"), provider.refreshes)
-			}
-			if test.status == http.StatusOK && (response.Header.Get("X-Auth-Sub") != userID || cookieNamed(response, sessionCookieName) == nil) {
-				t.Fatalf("refreshed session: %q %v", response.Header.Get("X-Auth-Sub"), response.Cookies())
-			}
-		})
 	}
 }
 
@@ -574,33 +413,28 @@ func TestRefresh(t *testing.T) {
 	session := logIn(t, auth, provider, userCertificate)
 
 	provider.advance(refreshInterval - time.Second)
-	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusOK || len(response.Cookies()) != 0 || provider.refreshes != 0 {
-		t.Fatalf("before the refresh is due: %d %v, %d refreshes", response.StatusCode, response.Cookies(), provider.refreshes)
+	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusOK || provider.refreshes != 0 {
+		t.Fatalf("before the refresh is due: %d, %d refreshes", response.StatusCode, provider.refreshes)
 	}
 
 	provider.user.Groups = []string{"admins"}
 	provider.advance(time.Second)
-	response := get(t, auth, "/page", userCertificate, session)
-	refreshed := cookieNamed(response, sessionCookieName)
-	if response.StatusCode != http.StatusOK || provider.refreshes != 1 || refreshed == nil || refreshed.Value == session.Value || response.Header.Get("X-Auth-Groups") != "admins" {
+	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusOK || len(response.Cookies()) != 0 || provider.refreshes != 1 || response.Header.Get("X-Auth-Groups") != "admins" {
 		t.Fatalf("refresh: %d %v, %d refreshes, groups %q", response.StatusCode, response.Cookies(), provider.refreshes, response.Header.Get("X-Auth-Groups"))
 	}
-	if refreshed.MaxAge != int((sessionLifetime - refreshInterval).Seconds()) {
-		t.Fatalf("refresh extended the session to %ds", refreshed.MaxAge)
-	}
-	if response := get(t, auth, "/page", userCertificate, refreshed); response.StatusCode != http.StatusOK || len(response.Cookies()) != 0 || provider.refreshes != 1 {
-		t.Fatalf("refreshed cookie: %d, %d refreshes", response.StatusCode, provider.refreshes)
+	provider.advance(refreshInterval)
+	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusOK || provider.refreshes != 2 {
+		t.Fatalf("refresh with the rotated token: %d, %d refreshes", response.StatusCode, provider.refreshes)
 	}
 }
 
 func TestRefreshEndsSession(t *testing.T) {
 	tests := map[string]func(*fakePocketID){
-		"user disabled":        func(fake *fakePocketID) { fake.disabled = true },
-		"another user":         func(fake *fakePocketID) { fake.user.Subject = otherUserID },
-		"groups no longer fit": func(fake *fakePocketID) { fake.user.Groups = groupNames(100) },
+		"user disabled": func(fake *fakePocketID) { fake.disabled = true },
+		"another user":  func(fake *fakePocketID) { fake.user.Subject = otherUserID },
 		"login revoked at the provider": func(fake *fakePocketID) {
-			for _, issuedGrant := range fake.grantsByIDToken {
-				issuedGrant.revoked = true
+			for _, issued := range fake.issuedRefreshTokens {
+				issued.grant.revoked = true
 			}
 		},
 	}
@@ -613,10 +447,11 @@ func TestRefreshEndsSession(t *testing.T) {
 			change(provider)
 			provider.advance(refreshInterval)
 
-			response := get(t, auth, "/page", userCertificate, session)
-			expired := cookieNamed(response, sessionCookieName)
-			if response.StatusCode != http.StatusFound || response.Header.Get("Location") != loginPath+"?rd=%2Fpage" || expired == nil || expired.MaxAge >= 0 {
-				t.Fatalf("%d %v", response.StatusCode, response.Cookies())
+			if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusFound || response.Header.Get("Location") != loginPath+"?rd=%2Fpage" {
+				t.Fatalf("%d %s", response.StatusCode, response.Header.Get("Location"))
+			}
+			if _, found := auth.sessions.get(session.Value); found {
+				t.Fatal("session kept")
 			}
 			if entries := logs.FilterMessage("session ended").All(); len(entries) != 1 || entries[0].ContextMap()["sub"] != userID {
 				t.Fatalf("logs: %v", logs.All())
@@ -642,7 +477,7 @@ func TestUnavailableIdentityProvider(t *testing.T) {
 	}
 
 	provider.down = false
-	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusOK || cookieNamed(response, sessionCookieName) == nil {
+	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusOK || provider.refreshes != 3 {
 		t.Fatalf("after the outage: %d", response.StatusCode)
 	}
 }
@@ -664,10 +499,9 @@ func TestConcurrentRefreshes(t *testing.T) {
 		close(release)
 		waitGroup.Wait()
 
-		want := cookieNamed(responses[0], sessionCookieName)
 		for _, response := range responses {
-			if cookie := cookieNamed(response, sessionCookieName); response.StatusCode != http.StatusOK || cookie == nil || cookie.Value != want.Value {
-				t.Fatalf("%d %v", response.StatusCode, response.Cookies())
+			if response.StatusCode != http.StatusOK || response.Header.Get("X-Auth-Sub") != userID {
+				t.Fatalf("%d", response.StatusCode)
 			}
 		}
 		if provider.refreshes != 1 {
@@ -696,35 +530,37 @@ func TestCancelledRequestKeepsRefresh(t *testing.T) {
 		close(release)
 		waitGroup.Wait()
 
-		if waiting.StatusCode != http.StatusOK || cookieNamed(waiting, sessionCookieName) == nil || provider.refreshes != 1 {
-			t.Fatalf("%d %v, %d refreshes", waiting.StatusCode, waiting.Cookies(), provider.refreshes)
+		if waiting.StatusCode != http.StatusOK || provider.refreshes != 1 {
+			t.Fatalf("%d, %d refreshes", waiting.StatusCode, provider.refreshes)
 		}
 	})
 }
 
-func TestRefreshAcrossInstances(t *testing.T) {
-	auth, provider := newTestAuth(t)
-	other := newAuthWithSecret(t, provider, "secret")
-	session := logIn(t, auth, provider, userCertificate)
-	provider.advance(refreshInterval)
+func TestLogoutDuringRefresh(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		auth, provider := newTestAuth(t)
+		session := logIn(t, auth, provider, userCertificate)
+		provider.advance(refreshInterval)
+		release := make(chan struct{})
+		provider.onRefresh = func() { <-release }
 
-	first := cookieNamed(get(t, auth, "/page", userCertificate, session), sessionCookieName)
-	if first == nil {
-		t.Fatal("first refresh set no cookie")
-	}
-	provider.advance(30 * time.Second)
-	if response := get(t, other, "/page", userCertificate, session); response.StatusCode != http.StatusOK || cookieNamed(response, sessionCookieName) == nil {
-		t.Fatalf("parallel refresh on another instance: %d", response.StatusCode)
-	}
+		var waitGroup sync.WaitGroup
+		var refreshing *http.Response
+		waitGroup.Go(func() { refreshing = get(t, auth, "/page", userCertificate, session) })
+		synctest.Wait()
+		if response := serve(t, auth, newHTTPRequest(http.MethodPost, logoutPath, userCertificate, session)); response.StatusCode != http.StatusSeeOther {
+			t.Fatalf("logout: %d", response.StatusCode)
+		}
+		close(release)
+		waitGroup.Wait()
 
-	provider.advance(time.Minute)
-	if response := get(t, other, "/page", userCertificate, session); response.StatusCode != http.StatusFound {
-		t.Fatalf("stale copy after the grace period: %d", response.StatusCode)
-	}
-	provider.advance(refreshInterval)
-	if response := get(t, auth, "/page", userCertificate, first); response.StatusCode != http.StatusFound {
-		t.Fatalf("session after its grant was revoked: %d", response.StatusCode)
-	}
+		if refreshing.StatusCode != http.StatusFound {
+			t.Fatalf("request whose refresh finished after the logout: %d", refreshing.StatusCode)
+		}
+		if _, found := auth.sessions.get(session.Value); found {
+			t.Fatal("the refresh brought the session back")
+		}
+	})
 }
 
 func TestSessionExpires(t *testing.T) {
@@ -732,45 +568,12 @@ func TestSessionExpires(t *testing.T) {
 	session := logIn(t, auth, provider, userCertificate)
 
 	provider.advance(sessionLifetime - time.Second)
-	response := get(t, auth, "/page", userCertificate, session)
-	refreshed := cookieNamed(response, sessionCookieName)
-	if response.StatusCode != http.StatusOK || refreshed == nil || refreshed.MaxAge != 1 {
-		t.Fatalf("last second: %d %v", response.StatusCode, response.Cookies())
+	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusOK {
+		t.Fatalf("last second: %d", response.StatusCode)
 	}
-
 	provider.advance(time.Second)
-	if response := get(t, auth, "/page", userCertificate, refreshed); response.StatusCode != http.StatusFound || provider.refreshes != 1 {
+	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusFound || provider.refreshes != 1 {
 		t.Fatalf("after 12 hours: %d, %d refreshes", response.StatusCode, provider.refreshes)
-	}
-
-	auth, provider = newTestAuth(t)
-	session = logIn(t, auth, provider, userCertificate)
-	provider.advance(sessionLifetime - time.Second)
-	provider.onRefresh = func() { provider.advance(time.Second) }
-	response = get(t, auth, "/page", userCertificate, session)
-	if expired := cookieNamed(response, sessionCookieName); response.StatusCode != http.StatusFound || expired == nil || expired.MaxAge >= 0 {
-		t.Fatalf("refresh that ends after 12 hours: %d %v", response.StatusCode, response.Cookies())
-	}
-}
-
-func TestSessionCookieSize(t *testing.T) {
-	for _, groupCount := range []int{0, 10, 30, 100} {
-		auth, provider := newTestAuth(t)
-		core, logs := observer.New(zap.InfoLevel)
-		auth.log = zap.New(core)
-		provider.user.Groups = groupNames(groupCount)
-		response := completeLoginAtProvider(t, auth, provider, get(t, auth, loginPath, userCertificate), userCertificate)
-		session := cookieNamed(response, sessionCookieName)
-		if fits := groupCount <= 30; fits != (session != nil) {
-			t.Fatalf("%d groups: %d", groupCount, response.StatusCode)
-		}
-		if session == nil {
-			if response.StatusCode != http.StatusInternalServerError || logs.FilterMessage("login failed").Len() != 1 {
-				t.Fatalf("%d groups: %d %v", groupCount, response.StatusCode, logs.All())
-			}
-			continue
-		}
-		t.Logf("%d groups: Set-Cookie of %d bytes, value of %d bytes", groupCount, len(session.String()), len(session.Value))
 	}
 }
 
@@ -825,6 +628,21 @@ func TestLogin(t *testing.T) {
 	}
 }
 
+func TestLoginReplacesSession(t *testing.T) {
+	auth, provider := newTestAuth(t)
+	first := logIn(t, auth, provider, userCertificate)
+	second := cookieNamed(completeLoginAtProvider(t, auth, provider, get(t, auth, loginPath, userCertificate, first), userCertificate, first), sessionCookieName)
+	if second == nil || second.Value == first.Value {
+		t.Fatalf("second login set %v", second)
+	}
+	if response := get(t, auth, "/page", userCertificate, first); response.StatusCode != http.StatusFound {
+		t.Fatalf("replaced session: %d", response.StatusCode)
+	}
+	if response := get(t, auth, "/page", userCertificate, second); response.StatusCode != http.StatusOK {
+		t.Fatalf("new session: %d", response.StatusCode)
+	}
+}
+
 func TestNewLoginReplacesPendingLogin(t *testing.T) {
 	auth, provider := newTestAuth(t)
 	first := get(t, auth, loginPath+"?rd=%2Ffirst", userCertificate)
@@ -875,13 +693,10 @@ func TestCallbackNeedsItsPendingLogin(t *testing.T) {
 	auth, provider := newTestAuth(t)
 	first, second := get(t, auth, loginPath, userCertificate), get(t, auth, loginPath, userCertificate)
 	callback := provider.approveLogin(first.Header.Get("Location"))
-	tampered := *pendingLoginCookie(first)
-	tampered.Value = tamper(tampered.Value)
 
 	for name, cookies := range map[string][]*http.Cookie{
 		"another browser":       nil,
 		"another pending login": {pendingLoginCookie(second)},
-		"tampered login cookie": {&tampered},
 	} {
 		if response := get(t, auth, callback, userCertificate, cookies...); response.StatusCode != http.StatusBadRequest || cookieNamed(response, sessionCookieName) != nil {
 			t.Fatalf("%s: %d", name, response.StatusCode)
@@ -889,6 +704,14 @@ func TestCallbackNeedsItsPendingLogin(t *testing.T) {
 	}
 	if response := get(t, auth, callbackPath+"?code=x", userCertificate, pendingLoginCookie(first)); response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("without state: %d", response.StatusCode)
+	}
+	for range 20 {
+		login := get(t, auth, loginPath, userCertificate)
+		tampered := *pendingLoginCookie(login)
+		tampered.Value = tamper(tampered.Value)
+		if response := get(t, auth, provider.approveLogin(login.Header.Get("Location")), userCertificate, &tampered); response.StatusCode < http.StatusBadRequest || cookieNamed(response, sessionCookieName) != nil {
+			t.Fatalf("tampered login cookie: %d", response.StatusCode)
+		}
 	}
 
 	session := cookieNamed(get(t, auth, callback, userCertificate, pendingLoginCookie(first)), sessionCookieName)
@@ -1010,81 +833,32 @@ func TestLogout(t *testing.T) {
 			hint = query.Get("id_token_hint")
 		}
 	}
-	if user, err := parseUnverifiedClaims(hint); err != nil || user.Subject != userID {
-		t.Fatalf("hint is not the ID token: %v %+v", err, user)
-	}
-	if provider.endSessions != 1 {
-		t.Fatalf("ended %d sessions at the identity provider", provider.endSessions)
+	if hint != provider.lastIDToken {
+		t.Fatalf("hint %q is not the ID token", hint)
 	}
 }
 
-func TestLogoutEndsLoginAtIdentityProvider(t *testing.T) {
+func TestLogoutEndsSessionImmediately(t *testing.T) {
 	auth, provider := newTestAuth(t)
 	session := logIn(t, auth, provider, userCertificate)
-	if response := serve(t, auth, newHTTPRequest(http.MethodPost, logoutPath, userCertificate, session)); response.StatusCode != http.StatusSeeOther || provider.endSessions != 1 {
-		t.Fatalf("logout: %d, %d sessions ended", response.StatusCode, provider.endSessions)
+	if response := serve(t, auth, newHTTPRequest(http.MethodPost, logoutPath, userCertificate, session)); response.StatusCode != http.StatusSeeOther {
+		t.Fatalf("logout: %d", response.StatusCode)
 	}
-
-	provider.advance(refreshInterval - time.Second)
-	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusOK {
-		t.Fatalf("copied cookie before its next refresh: %d", response.StatusCode)
-	}
-	provider.advance(time.Second)
-	response := get(t, auth, "/page", userCertificate, session)
-	if expired := cookieNamed(response, sessionCookieName); response.StatusCode != http.StatusFound || expired == nil || expired.MaxAge >= 0 {
-		t.Fatalf("copied cookie at its next refresh: %d %v", response.StatusCode, response.Cookies())
+	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusFound {
+		t.Fatalf("copied cookie after logout: %d", response.StatusCode)
 	}
 }
 
-func TestLogoutWhileIdentityProviderIsDown(t *testing.T) {
-	auth, provider := newTestAuth(t)
-	core, logs := observer.New(zap.InfoLevel)
-	auth.log = zap.New(core)
-	session := logIn(t, auth, provider, userCertificate)
-
-	provider.down = true
-	response := serve(t, auth, newHTTPRequest(http.MethodPost, logoutPath, userCertificate, session))
-	if expired := cookieNamed(response, sessionCookieName); response.StatusCode != http.StatusSeeOther || expired == nil || expired.MaxAge >= 0 {
-		t.Fatalf("logout: %d %v", response.StatusCode, response.Cookies())
+func TestSessionStoreRemovesExpiredSessions(t *testing.T) {
+	store := newSessionStore()
+	now := time.Now()
+	expired := store.add(session{expiresAt: now.Add(time.Minute)}, now)
+	current := store.add(session{expiresAt: now.Add(2 * time.Hour)}, now.Add(time.Hour))
+	if _, found := store.get(expired); found {
+		t.Fatal("expired session kept")
 	}
-	if entries := logs.FilterMessage("logout did not end the login at the identity provider").All(); len(entries) != 1 || entries[0].ContextMap()["sub"] != userID {
-		t.Fatalf("logs: %v", logs.All())
-	}
-
-	provider.down = false
-	provider.advance(refreshInterval)
-	if response := get(t, auth, "/page", userCertificate, session); response.StatusCode != http.StatusOK {
-		t.Fatalf("copied cookie after the outage: %d", response.StatusCode)
-	}
-}
-
-func TestSealedCookie(t *testing.T) {
-	auth, provider := newTestAuth(t)
-	cookie, err := auth.sealCookie(sessionCookieName, session{Host: host}, 60)
-	if err != nil || cookie.Name != sessionCookieName || cookie.MaxAge != 60 || !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.Path != "/" {
-		t.Fatalf("%v %+v", err, cookie)
-	}
-	var stored session
-	if err := auth.openCookie(sessionCookieName, cookie.Value, &stored); err != nil || stored.Host != host {
-		t.Fatalf("%v %+v", err, stored)
-	}
-
-	for name, attempt := range map[string]func() error{
-		"tampered":     func() error { return auth.openCookie(sessionCookieName, tamper(cookie.Value), &stored) },
-		"another name": func() error { return auth.openCookie(loginCookieName, cookie.Value, &stored) },
-		"another key": func() error {
-			return newAuthWithSecret(t, provider, "other secret").openCookie(sessionCookieName, cookie.Value, &stored)
-		},
-		"too short": func() error { return auth.openCookie(sessionCookieName, "AAAA", &stored) },
-		"empty":     func() error { return auth.openCookie(sessionCookieName, "", &stored) },
-	} {
-		if err := attempt(); err == nil {
-			t.Fatalf("%s: opened", name)
-		}
-	}
-
-	if _, err := auth.sealCookie(sessionCookieName, session{Host: strings.Repeat("a", maxCookieSize)}, 60); !errors.Is(err, errCookieTooLarge) {
-		t.Fatalf("large cookie: %v", err)
+	if _, found := store.get(current); !found {
+		t.Fatal("current session removed")
 	}
 }
 

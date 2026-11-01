@@ -2,11 +2,7 @@ package castelnuovo
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/hkdf"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -16,12 +12,14 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -42,7 +40,6 @@ const (
 var (
 	yubikeyCertificateURI = regexp.MustCompile(`^spiffe://castelnuovo\.eu/yubikey/[0-9]+/owner/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
 	crossOriginProtection = http.NewCrossOriginProtection()
-	errCookieTooLarge     = errors.New("cookie is larger than 4096 bytes")
 )
 
 type requestState struct {
@@ -64,7 +61,8 @@ func (auth *Auth) ServeHTTP(response http.ResponseWriter, httpRequest *http.Requ
 
 	switch path, method := request.original.URL.Path, request.original.Method; {
 	case path == loginPath && method == http.MethodGet:
-		return auth.startLogin(request)
+		auth.startLogin(request)
+		return nil
 	case path == callbackPath && method == http.MethodGet:
 		return auth.finishLogin(request)
 	case path == logoutPath && method == http.MethodPost:
@@ -168,79 +166,56 @@ func methodNotAllowed(response http.ResponseWriter, path, allow string) error {
 }
 
 type session struct {
-	IDToken      string `json:"i"`
-	RefreshToken string `json:"r"`
-	RefreshedAt  int64  `json:"f"`
-	ExpiresAt    int64  `json:"x"`
-	Host         string `json:"h"`
-	Certificate  string `json:"c,omitempty"`
-}
-
-type refreshResult struct {
-	cookie *http.Cookie
-	claims claims
+	user         claims
+	idToken      string
+	refreshToken string
+	host         string
+	certificate  string
+	refreshedAt  time.Time
+	expiresAt    time.Time
 }
 
 func (auth *Auth) authenticate(request *requestState) (*claims, error) {
-	now := auth.now().Unix()
-	stored, subject, ok := auth.openSessionCookie(request)
+	now := auth.now()
+	current, found := auth.sessions.get(request.sessionCookie)
 	switch {
-	case !ok || now >= stored.ExpiresAt:
+	case !found || !now.Before(current.expiresAt):
 		return nil, nil
-	case stored.Host != request.current.Host || stored.Certificate != request.certificate:
-		request.log.Warn("session used from another host or certificate", zap.String("sub", subject), zap.String("session_host", stored.Host), zap.String("session_certificate", stored.Certificate))
+	case current.host != request.current.Host || current.certificate != request.certificate:
+		request.log.Warn("session used from another host or certificate", zap.String("sub", current.user.Subject), zap.String("session_host", current.host), zap.String("session_certificate", current.certificate))
 		return nil, nil
-	}
-	ctx := context.WithoutCancel(request.current.Context())
-	if now-stored.RefreshedAt < int64(refreshInterval.Seconds()) {
-		if verifiedUser, err := auth.identityProvider.verifyIDToken(ctx, stored.IDToken); err == nil {
-			return &verifiedUser, nil
-		}
+	case now.Sub(current.refreshedAt) < refreshInterval:
+		return &current.user, nil
 	}
 
-	result, err, _ := auth.runningRefreshes.Do(stored.RefreshToken, func() (any, error) {
-		return auth.refreshSession(ctx, stored, subject)
+	result, err, _ := auth.sessions.runningRefreshes.Do(request.sessionCookie, func() (any, error) {
+		return auth.refreshSession(context.WithoutCancel(request.current.Context()), request.sessionCookie, current)
 	})
 	switch {
 	case errors.Is(err, errUnavailable):
-		return nil, request.deny(http.StatusBadGateway, err, zap.String("sub", subject))
+		return nil, request.deny(http.StatusBadGateway, err, zap.String("sub", current.user.Subject))
 	case err != nil:
-		expireCookie(request.response, sessionCookieName)
-		request.log.Warn("session ended", zap.String("sub", subject), zap.Error(err))
+		auth.sessions.remove(request.sessionCookie)
+		request.log.Warn("session ended", zap.String("sub", current.user.Subject), zap.Error(err))
 		return nil, nil
 	}
-	refreshed := result.(refreshResult)
-	http.SetCookie(request.response, refreshed.cookie)
-	return &refreshed.claims, nil
+	refreshed := result.(session)
+	return &refreshed.user, nil
 }
 
-func (auth *Auth) openSessionCookie(request *requestState) (stored session, subject string, ok bool) {
-	if auth.openCookie(sessionCookieName, request.sessionCookie, &stored) != nil {
-		return session{}, "", false
-	}
-	unverified, err := parseUnverifiedClaims(stored.IDToken)
-	return stored, unverified.Subject, err == nil
-}
-
-func (auth *Auth) refreshSession(ctx context.Context, stored session, subject string) (refreshResult, error) {
-	issued, err := auth.identityProvider.refreshTokens(ctx, stored.RefreshToken)
+func (auth *Auth) refreshSession(ctx context.Context, id string, current session) (session, error) {
+	issued, err := auth.identityProvider.refreshTokens(ctx, current.refreshToken)
 	switch {
 	case err != nil:
-		return refreshResult{}, err
-	case issued.claims.Subject != subject:
-		return refreshResult{}, errors.New("refresh returned another user")
+		return session{}, err
+	case issued.claims.Subject != current.user.Subject:
+		return session{}, errors.New("refresh returned another user")
 	}
-	now := auth.now().Unix()
-	if now >= stored.ExpiresAt {
-		return refreshResult{}, errors.New("session expired during the refresh")
+	current.user, current.idToken, current.refreshToken, current.refreshedAt = issued.claims, issued.idToken, issued.refreshToken, auth.now()
+	if !auth.sessions.replace(id, current) {
+		return session{}, errors.New("session ended during the refresh")
 	}
-	stored.IDToken, stored.RefreshToken, stored.RefreshedAt = issued.idToken, issued.refreshToken, now
-	cookie, err := auth.sealSessionCookie(stored)
-	return refreshResult{cookie, issued.claims}, err
-}
-
-func (auth *Auth) sealSessionCookie(stored session) (*http.Cookie, error) {
-	return auth.sealCookie(sessionCookieName, stored, int(stored.ExpiresAt-stored.RefreshedAt))
+	return current, nil
 }
 
 func requireLogin(request *requestState) error {
@@ -259,19 +234,20 @@ type pendingLogin struct {
 	Redirect     string `json:"r,omitempty"`
 }
 
-func (auth *Auth) startLogin(request *requestState) error {
+func (auth *Auth) startLogin(request *requestState) {
 	pending := pendingLogin{State: rand.Text(), Nonce: rand.Text(), CodeVerifier: oauth2.GenerateVerifier(), Redirect: request.original.URL.Query().Get("rd")}
-	cookie, err := auth.sealCookie(loginCookieName, pending, int(loginTimeout.Seconds()))
-	if errors.Is(err, errCookieTooLarge) {
+	cookie := newCookie(loginCookieName, pending.encode(), int(loginTimeout.Seconds()))
+	if len(cookie.String()) > maxCookieSize {
 		pending.Redirect = ""
-		cookie, err = auth.sealCookie(loginCookieName, pending, int(loginTimeout.Seconds()))
-	}
-	if err != nil {
-		return err
+		cookie.Value = pending.encode()
 	}
 	http.SetCookie(request.response, cookie)
 	http.Redirect(request.response, request.current, auth.identityProvider.authorizationURL(callbackURL(request.current.Host), pending.State, pending.Nonce, pending.CodeVerifier), http.StatusFound)
-	return nil
+}
+
+func (pending pendingLogin) encode() string {
+	encoded, _ := json.Marshal(pending)
+	return base64.RawURLEncoding.EncodeToString(encoded)
 }
 
 func callbackURL(host string) string {
@@ -280,11 +256,11 @@ func callbackURL(host string) string {
 
 func (auth *Auth) finishLogin(request *requestState) error {
 	query := request.original.URL.Query()
-	var pending pendingLogin
+	pending, err := decodePendingLogin(request.loginCookie)
 	switch {
 	case request.loginCookie == "":
 		return request.deny(http.StatusBadRequest, errors.New("callback without a pending login"))
-	case auth.openCookie(loginCookieName, request.loginCookie, &pending) != nil:
+	case err != nil || pending.State == "":
 		expireCookie(request.response, loginCookieName)
 		return request.deny(http.StatusBadRequest, errors.New("login cookie is invalid"))
 	case pending.State != query.Get("state"):
@@ -307,20 +283,18 @@ func (auth *Auth) finishLogin(request *requestState) error {
 		return request.deny(http.StatusForbidden, err, zap.String("sub", user.Subject))
 	}
 
-	now := auth.now().Unix()
-	cookie, err := auth.sealSessionCookie(session{
-		IDToken:      issued.idToken,
-		RefreshToken: issued.refreshToken,
-		RefreshedAt:  now,
-		ExpiresAt:    now + int64(sessionLifetime.Seconds()),
-		Host:         request.current.Host,
-		Certificate:  request.certificate,
-	})
-	if err != nil {
-		request.log.Error("login failed", zap.String("sub", user.Subject), zap.Error(err))
-		return caddyhttp.Error(http.StatusInternalServerError, err)
-	}
-	http.SetCookie(request.response, cookie)
+	now := auth.now()
+	auth.sessions.remove(request.sessionCookie)
+	id := auth.sessions.add(session{
+		user:         user,
+		idToken:      issued.idToken,
+		refreshToken: issued.refreshToken,
+		host:         request.current.Host,
+		certificate:  request.certificate,
+		refreshedAt:  now,
+		expiresAt:    now.Add(sessionLifetime),
+	}, now)
+	http.SetCookie(request.response, newCookie(sessionCookieName, id, int(sessionLifetime.Seconds())))
 	request.log.Info("user logged in", zap.String("sub", user.Subject))
 
 	if !isLocalPath(pending.Redirect) {
@@ -328,6 +302,15 @@ func (auth *Auth) finishLogin(request *requestState) error {
 	}
 	http.Redirect(request.response, request.current, pending.Redirect, http.StatusFound)
 	return nil
+}
+
+func decodePendingLogin(value string) (pendingLogin, error) {
+	var pending pendingLogin
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err == nil {
+		err = json.Unmarshal(decoded, &pending)
+	}
+	return pending, err
 }
 
 func (auth *Auth) checkLoginClaims(user claims, nonce, certificate string) error {
@@ -357,51 +340,64 @@ func (auth *Auth) logout(request *requestState) error {
 		return request.deny(http.StatusForbidden, err)
 	}
 	expireCookie(request.response, sessionCookieName)
-	stored, subject, ok := auth.openSessionCookie(request)
-	if ok {
-		if err := auth.identityProvider.endSession(context.WithoutCancel(request.current.Context()), stored.IDToken); err != nil {
-			request.log.Warn("logout did not end the login at the identity provider", zap.String("sub", subject), zap.Error(err))
-		}
-		request.log.Info("user logged out", zap.String("sub", subject))
+	ended, found := auth.sessions.remove(request.sessionCookie)
+	if found {
+		request.log.Info("user logged out", zap.String("sub", ended.user.Subject))
 	}
-	http.Redirect(request.response, request.current, auth.identityProvider.logoutURL(stored.IDToken, "https://"+request.current.Host+"/"), http.StatusSeeOther)
+	http.Redirect(request.response, request.current, auth.identityProvider.logoutURL(ended.idToken, "https://"+request.current.Host+"/"), http.StatusSeeOther)
 	return nil
 }
 
-func newCookieCipher(secret string) (cipher.AEAD, error) {
-	key, err := hkdf.Key(sha256.New, []byte(secret), nil, "castelnuovo_auth cookies", 32)
-	if err != nil {
-		return nil, err
-	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	return cipher.NewGCMWithRandomNonce(block)
+type sessionStore struct {
+	mutex            sync.Mutex
+	sessions         map[string]session
+	runningRefreshes singleflight.Group
 }
 
-func (auth *Auth) sealCookie(name string, value any, maxAge int) (*http.Cookie, error) {
-	plaintext, err := json.Marshal(value)
-	if err != nil {
-		return nil, err
-	}
-	cookie := newCookie(name, base64.RawURLEncoding.EncodeToString(auth.cookieCipher.Seal(nil, nil, plaintext, []byte(name))), maxAge)
-	if len(cookie.String()) > maxCookieSize {
-		return nil, errCookieTooLarge
-	}
-	return cookie, nil
+func newSessionStore() *sessionStore {
+	return &sessionStore{sessions: map[string]session{}}
 }
 
-func (auth *Auth) openCookie(name, sealedValue string, target any) error {
-	ciphertext, err := base64.RawURLEncoding.DecodeString(sealedValue)
-	if err != nil {
-		return err
+func (*sessionStore) Destruct() error {
+	return nil
+}
+
+func (store *sessionStore) get(id string) (session, bool) {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	found, ok := store.sessions[id]
+	return found, ok
+}
+
+func (store *sessionStore) add(created session, now time.Time) string {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	for id, existing := range store.sessions {
+		if !now.Before(existing.expiresAt) {
+			delete(store.sessions, id)
+		}
 	}
-	plaintext, err := auth.cookieCipher.Open(nil, nil, ciphertext, []byte(name))
-	if err != nil {
-		return err
+	id := rand.Text()
+	store.sessions[id] = created
+	return id
+}
+
+func (store *sessionStore) replace(id string, refreshed session) bool {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if _, ok := store.sessions[id]; !ok {
+		return false
 	}
-	return json.Unmarshal(plaintext, target)
+	store.sessions[id] = refreshed
+	return true
+}
+
+func (store *sessionStore) remove(id string) (session, bool) {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	removed, ok := store.sessions[id]
+	delete(store.sessions, id)
+	return removed, ok
 }
 
 func newCookie(name, value string, maxAge int) *http.Cookie {

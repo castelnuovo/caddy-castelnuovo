@@ -21,76 +21,73 @@ import (
 	"golang.org/x/oauth2"
 )
 
+const testIssuer = "https://id.test"
+
 type tokenRequest struct {
 	form           url.Values
 	user, password string
 }
 
 type testIdP struct {
-	*httptest.Server
 	key        *rsa.PrivateKey
 	claims     map[string]any
+	down       bool
 	status     int
 	jwksStatus int
 	omit       string
-	tokens     chan tokenRequest
+	requests   []tokenRequest
 }
 
-func newIdP(t *testing.T) *testIdP {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
+func (p *testIdP) RoundTrip(r *http.Request) (*http.Response, error) {
+	if p.down {
+		return nil, errors.New("connection refused")
 	}
-	p := &testIdP{key: key, tokens: make(chan tokenRequest, 10)}
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /.well-known/jwks.json", func(w http.ResponseWriter, r *http.Request) {
-		if p.jwksStatus != 0 {
-			w.WriteHeader(p.jwksStatus)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
-			"kty": "RSA",
-			"kid": "test",
-			"alg": "RS256",
-			"use": "sig",
-			"n":   base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
-			"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes()),
-		}}})
-	})
-	mux.HandleFunc("POST /api/oidc/token", func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		user, password, _ := r.BasicAuth()
-		p.tokens <- tokenRequest{r.PostForm, user, password}
-		w.Header().Set("Content-Type", "application/json")
-		if p.status != 0 {
-			w.WriteHeader(p.status)
-			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
-			return
-		}
-		response := map[string]any{
-			"access_token":  "access-token",
-			"token_type":    "Bearer",
-			"expires_in":    3600,
-			"id_token":      p.sign(),
-			"refresh_token": "new-refresh-token",
-		}
-		delete(response, p.omit)
-		_ = json.NewEncoder(w).Encode(response)
-	})
-	p.Server = httptest.NewTLSServer(mux)
-	t.Cleanup(p.Close)
-	p.claims = map[string]any{
-		"iss":       p.URL,
-		"aud":       "client",
-		"sub":       sub,
-		"exp":       time.Now().Add(time.Hour).Unix(),
-		"iat":       time.Now().Unix(),
-		"nonce":     "nonce",
-		"amr":       []string{"phr"},
-		"auth_time": time.Now().Unix(),
-		"groups":    []string{"admins"},
+	rec := httptest.NewRecorder()
+	switch r.URL.String() {
+	case testIssuer + "/.well-known/jwks.json":
+		p.jwks(rec)
+	case testIssuer + "/api/oidc/token":
+		p.token(rec, r)
+	default:
+		rec.WriteHeader(http.StatusNotFound)
 	}
-	return p
+	return rec.Result(), nil
+}
+
+func (p *testIdP) jwks(w http.ResponseWriter) {
+	if p.jwksStatus != 0 {
+		w.WriteHeader(p.jwksStatus)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
+		"kty": "RSA",
+		"kid": "test",
+		"alg": "RS256",
+		"use": "sig",
+		"n":   base64.RawURLEncoding.EncodeToString(p.key.N.Bytes()),
+		"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(p.key.E)).Bytes()),
+	}}})
+}
+
+func (p *testIdP) token(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	user, password, _ := r.BasicAuth()
+	p.requests = append(p.requests, tokenRequest{r.PostForm, user, password})
+	w.Header().Set("Content-Type", "application/json")
+	if p.status != 0 {
+		w.WriteHeader(p.status)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+		return
+	}
+	response := map[string]any{
+		"access_token":  "access-token",
+		"token_type":    "Bearer",
+		"expires_in":    3600,
+		"id_token":      p.sign(),
+		"refresh_token": "new-refresh-token",
+	}
+	delete(response, p.omit)
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 func (p *testIdP) sign() string {
@@ -101,51 +98,61 @@ func (p *testIdP) sign() string {
 	return input + "." + base64.RawURLEncoding.EncodeToString(signature)
 }
 
-func (p *testIdP) client() *oidcClient {
-	return newOIDC(p.URL, "client", "secret", p.Client())
+func newIdP(t *testing.T) (*testIdP, *oidcClient) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &testIdP{key: key, claims: map[string]any{
+		"iss":       testIssuer,
+		"aud":       "client",
+		"sub":       sub,
+		"exp":       time.Now().Add(time.Hour).Unix(),
+		"iat":       time.Now().Unix(),
+		"nonce":     "nonce",
+		"amr":       []string{"phr"},
+		"auth_time": time.Now().Unix(),
+		"groups":    []string{"admins"},
+	}}
+	return p, newOIDC(testIssuer, "client", "secret", &http.Client{Transport: p})
 }
 
 func TestOIDCAuthURL(t *testing.T) {
-	o := newOIDC(issuer, "client", "secret", http.DefaultClient)
+	o := newOIDC(issuer, "client", "secret", nil)
 	verifier := oauth2.GenerateVerifier()
-	for _, reauth := range []bool{false, true} {
-		u, _ := url.Parse(o.authURL("https://"+host+callbackPath, "state", "nonce", verifier, reauth))
-		want := url.Values{
-			"client_id":             {"client"},
-			"redirect_uri":          {"https://" + host + callbackPath},
-			"response_type":         {"code"},
-			"scope":                 {"openid profile email groups offline_access"},
-			"state":                 {"state"},
-			"nonce":                 {"nonce"},
-			"code_challenge":        {oauth2.S256ChallengeFromVerifier(verifier)},
-			"code_challenge_method": {"S256"},
-			"max_age":               {"3600"},
-		}
-		if reauth {
-			want.Set("prompt", "login")
-		}
-		if u.Scheme+"://"+u.Host+u.Path != issuer+"/authorize" || !maps.EqualFunc(u.Query(), want, slices.Equal[[]string]) {
-			t.Fatalf("reauth %v: %s", reauth, u)
-		}
+	u := must(url.Parse(o.authURL("https://"+host+callbackPath, "state", "nonce", verifier)))
+	want := url.Values{
+		"client_id":             {"client"},
+		"redirect_uri":          {"https://" + host + callbackPath},
+		"response_type":         {"code"},
+		"scope":                 {"openid profile email groups offline_access"},
+		"state":                 {"state"},
+		"nonce":                 {"nonce"},
+		"code_challenge":        {oauth2.S256ChallengeFromVerifier(verifier)},
+		"code_challenge_method": {"S256"},
+		"max_age":               {"3600"},
+	}
+	if u.Scheme+"://"+u.Host+u.Path != issuer+"/authorize" || !maps.EqualFunc(u.Query(), want, slices.Equal[[]string]) {
+		t.Fatalf("%s", u)
 	}
 }
 
 func TestOIDCExchange(t *testing.T) {
-	p := newIdP(t)
-	c, refreshToken, err := p.client().exchange(context.Background(), "https://"+host+callbackPath, "code", "verifier")
-	if err != nil || c.Subject != sub || c.Nonce != "nonce" || !slices.Equal(c.AMR, []string{"phr"}) || !slices.Equal(c.Groups, []string{"admins"}) || c.idToken == "" || refreshToken != "new-refresh-token" {
-		t.Fatalf("%v %+v %q", err, c, refreshToken)
+	p, o := newIdP(t)
+	got, err := o.exchange(context.Background(), "https://"+host+callbackPath, "code", "verifier")
+	c, _ := parseClaims(got.idToken)
+	if err != nil || got.refreshToken != "new-refresh-token" || c.Subject != sub || c.Nonce != "nonce" || !slices.Equal(c.AMR, []string{"phr"}) || !slices.Equal(c.Groups, []string{"admins"}) {
+		t.Fatalf("%v %+v %+v", err, got, c)
 	}
 
-	req := <-p.tokens
 	want := url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {"code"},
 		"code_verifier": {"verifier"},
 		"redirect_uri":  {"https://" + host + callbackPath},
 	}
-	if req.user != "client" || req.password != "secret" || !maps.EqualFunc(req.form, want, slices.Equal[[]string]) {
-		t.Fatalf("token request: %+v", req)
+	if len(p.requests) != 1 || p.requests[0].user != "client" || p.requests[0].password != "secret" || !maps.EqualFunc(p.requests[0].form, want, slices.Equal[[]string]) {
+		t.Fatalf("token requests: %+v", p.requests)
 	}
 }
 
@@ -158,62 +165,69 @@ func TestOIDCExchangeFails(t *testing.T) {
 		"code rejected":    {func(p *testIdP) { p.status = http.StatusBadRequest }, 1, false},
 		"server error":     {func(p *testIdP) { p.status = http.StatusServiceUnavailable }, 1, true},
 		"rate limited":     {func(p *testIdP) { p.status = http.StatusTooManyRequests }, 1, true},
-		"unreachable":      {func(p *testIdP) { p.Close() }, 0, true},
+		"unreachable":      {func(p *testIdP) { p.down = true }, 0, true},
 		"no ID token":      {func(p *testIdP) { p.omit = "id_token" }, 1, false},
 		"no refresh token": {func(p *testIdP) { p.omit = "refresh_token" }, 1, false},
 		"another audience": {func(p *testIdP) { p.claims["aud"] = "other" }, 1, false},
+		"another issuer":   {func(p *testIdP) { p.claims["iss"] = "https://evil.example" }, 1, false},
 		"expired ID token": {func(p *testIdP) { p.claims["exp"] = time.Now().Add(-time.Hour).Unix() }, 1, false},
-		"malformed claims": {func(p *testIdP) { p.claims["auth_time"] = "yesterday" }, 1, false},
 		"keys unavailable": {func(p *testIdP) { p.jwksStatus = http.StatusServiceUnavailable }, 1, true},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			p := newIdP(t)
-			o := p.client()
+			p, o := newIdP(t)
 			tt.change(p)
-			_, _, err := o.exchange(context.Background(), "https://"+host+callbackPath, "code", "verifier")
-			if err == nil || errors.Is(err, errUnavailable) != tt.unavailable || len(p.tokens) != tt.requests {
-				t.Fatalf("error %v after %d token requests", err, len(p.tokens))
+			_, err := o.exchange(context.Background(), "https://"+host+callbackPath, "code", "verifier")
+			if err == nil || errors.Is(err, errUnavailable) != tt.unavailable || len(p.requests) != tt.requests {
+				t.Fatalf("error %v after %d token requests", err, len(p.requests))
 			}
 		})
 	}
 }
 
 func TestOIDCRefresh(t *testing.T) {
-	p := newIdP(t)
-	o := p.client()
-
-	p.omit = "refresh_token"
-	c, refreshToken, err := o.refresh(context.Background(), "old-refresh-token")
-	if err != nil || c.Subject != sub || refreshToken != "old-refresh-token" {
-		t.Fatalf("%v %+v %q", err, c, refreshToken)
+	p, o := newIdP(t)
+	got, err := o.refresh(context.Background(), "old-refresh-token")
+	if c, _ := parseClaims(got.idToken); err != nil || c.Subject != sub || got.refreshToken != "new-refresh-token" {
+		t.Fatalf("%v %+v", err, got)
 	}
-	req := <-p.tokens
 	want := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"old-refresh-token"}}
-	if req.user != "client" || req.password != "secret" || !maps.EqualFunc(req.form, want, slices.Equal[[]string]) {
-		t.Fatalf("token request: %+v", req)
+	if len(p.requests) != 1 || p.requests[0].user != "client" || p.requests[0].password != "secret" || !maps.EqualFunc(p.requests[0].form, want, slices.Equal[[]string]) {
+		t.Fatalf("token requests: %+v", p.requests)
 	}
 
 	p.status = http.StatusBadRequest
-	if _, _, err := o.refresh(context.Background(), "old-refresh-token"); err == nil || errors.Is(err, errUnavailable) {
+	if _, err := o.refresh(context.Background(), "old-refresh-token"); err == nil || errors.Is(err, errUnavailable) {
 		t.Fatalf("rejected refresh token: %v", err)
 	}
 	p.status = http.StatusBadGateway
-	if _, _, err := o.refresh(context.Background(), "old-refresh-token"); !errors.Is(err, errUnavailable) {
+	if _, err := o.refresh(context.Background(), "old-refresh-token"); !errors.Is(err, errUnavailable) {
 		t.Fatalf("server error: %v", err)
 	}
 }
 
 func TestOIDCLogoutURL(t *testing.T) {
-	o := newOIDC(issuer, "client", "secret", http.DefaultClient)
+	o := newOIDC(issuer, "client", "secret", nil)
 	redirect := "https://" + host + "/"
 	for idToken, want := range map[string]url.Values{
 		"id-token": {"id_token_hint": {"id-token"}, "client_id": {"client"}, "post_logout_redirect_uri": {redirect}},
 		"":         {"client_id": {"client"}, "post_logout_redirect_uri": {redirect}},
 	} {
-		u, _ := url.Parse(o.logoutURL(idToken, redirect))
+		u := must(url.Parse(o.logoutURL(idToken, redirect)))
 		if u.Scheme+"://"+u.Host+u.Path != issuer+"/api/oidc/end-session" || !maps.EqualFunc(u.Query(), want, slices.Equal[[]string]) {
 			t.Fatalf("ID token %q: %s", idToken, u)
+		}
+	}
+}
+
+func TestParseClaims(t *testing.T) {
+	c, err := parseClaims(fakeJWT(map[string]any{"sub": sub, "groups": []string{"a", "b"}, "auth_time": 42}))
+	if err != nil || c.Subject != sub || !slices.Equal(c.Groups, []string{"a", "b"}) || c.AuthTime != 42 {
+		t.Fatalf("%v %+v", err, c)
+	}
+	for _, idToken := range []string{"", "a.b", "a.%%%.c", "a." + base64.RawURLEncoding.EncodeToString([]byte("[]")) + ".c", "a.b.c.d"} {
+		if _, err := parseClaims(idToken); err == nil {
+			t.Fatalf("parsed %q", idToken)
 		}
 	}
 }

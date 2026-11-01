@@ -1,10 +1,7 @@
 package castelnuovo
 
 import (
-	"bytes"
 	"crypto/rand"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"slices"
@@ -12,6 +9,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 )
@@ -22,158 +20,117 @@ const (
 	maxPendingLogins = 3
 )
 
-var (
-	crossOrigin    = http.NewCrossOriginProtection()
-	errLoginTooOld = errors.New("login is too old")
-)
+var crossOrigin = http.NewCrossOriginProtection()
 
 type pendingLogin struct {
-	State    string `json:"state"`
-	Nonce    string `json:"nonce"`
-	Verifier string `json:"verifier"`
-	Redirect string `json:"redirect"`
-	Reauth   bool   `json:"reauth,omitempty"`
+	Nonce    string `json:"n"`
+	Verifier string `json:"v"`
+	Redirect string `json:"r,omitempty"`
 }
 
-func (m *Auth) login(req *request, redirect string, reauth bool) {
-	dropPendingLogins(req)
-	l := pendingLogin{
-		State:    rand.Text(),
-		Nonce:    rand.Text(),
-		Verifier: oauth2.GenerateVerifier(),
-		Redirect: redirect,
-		Reauth:   reauth,
+func (m *Auth) login(req *request) error {
+	if len(req.logins) >= maxPendingLogins {
+		for state := range req.logins {
+			expire(req.w, loginCookie+state)
+		}
 	}
-	setCookie(req.w, loginCookie+l.State, l.cookie(), loginTimeout)
-	http.Redirect(req.w, req.r, m.idp.authURL(callbackURL(req.r.Host), l.State, l.Nonce, l.Verifier, reauth), http.StatusFound)
-}
-
-func dropPendingLogins(req *request) {
-	if len(req.logins) < maxPendingLogins {
-		return
+	state := rand.Text()
+	l := pendingLogin{Nonce: rand.Text(), Verifier: oauth2.GenerateVerifier(), Redirect: req.orig.URL.Query().Get("rd")}
+	c, err := m.seal(loginCookie+state, l, int(loginTimeout.Seconds()))
+	if errors.Is(err, errCookieTooLarge) {
+		l.Redirect = ""
+		c, err = m.seal(loginCookie+state, l, int(loginTimeout.Seconds()))
 	}
-	for state := range req.logins {
-		setCookie(req.w, loginCookie+state, "", -time.Second)
-	}
-}
-
-func (m *Auth) callback(req *request) error {
-	query := original(req.r).Query()
-	state := query.Get("state")
-	if _, ok := req.logins[state]; !ok || state == "" {
-		return m.callbackWithoutLogin(req)
-	}
-	l, err := takeLogin(req, state)
 	if err != nil {
 		return err
 	}
-	if query.Get("code") == "" {
-		return deny(http.StatusForbidden, errors.New("identity provider returned an error"), zap.String("idp_error", query.Get("error")))
-	}
-
-	c, refreshToken, err := m.idp.exchange(req.r.Context(), callbackURL(req.r.Host), query.Get("code"), l.Verifier)
-	switch {
-	case errors.Is(err, errUnavailable):
-		return deny(http.StatusBadGateway, err)
-	case err != nil:
-		return deny(http.StatusForbidden, err)
-	}
-
-	err = m.checkLogin(c, l.Nonce, req.uri)
-	switch {
-	case errors.Is(err, errLoginTooOld) && !l.Reauth:
-		req.log.Info("asking for a new login", zap.String("sub", c.Subject), zap.Error(err))
-		m.login(req, l.Redirect, true)
-		return nil
-	case err != nil:
-		return deny(http.StatusForbidden, err, zap.String("sub", c.Subject))
-	}
-
-	m.startSession(req, c, refreshToken)
-	redirectLocal(req, l.Redirect)
+	http.SetCookie(req.w, c)
+	http.Redirect(req.w, req.r, m.idp.authURL(callbackURL(req.r.Host), state, l.Nonce, l.Verifier), http.StatusFound)
 	return nil
 }
 
-func (m *Auth) callbackWithoutLogin(req *request) error {
-	c, err := m.verify(req)
+func (m *Auth) callback(req *request) error {
+	query := req.orig.URL.Query()
+	state := query.Get("state")
+	value, ok := req.logins[state]
+	if !ok {
+		return req.deny(http.StatusBadRequest, errors.New("callback without a pending login"))
+	}
+	expire(req.w, loginCookie+state)
+	var l pendingLogin
+	if err := m.open(loginCookie+state, value, &l); err != nil {
+		return req.deny(http.StatusBadRequest, errors.New("login cookie is invalid"))
+	}
+	if query.Get("code") == "" {
+		return req.deny(http.StatusForbidden, errors.New("identity provider returned an error"), zap.String("idp_error", query.Get("error")))
+	}
+
+	t, err := m.idp.exchange(req.r.Context(), callbackURL(req.r.Host), query.Get("code"), l.Verifier)
 	switch {
+	case errors.Is(err, errUnavailable):
+		return req.deny(http.StatusBadGateway, err)
 	case err != nil:
-		return err
-	case c != nil:
-		redirectLocal(req, "/")
-		return nil
+		return req.deny(http.StatusForbidden, err)
 	}
-	return deny(http.StatusBadRequest, errors.New("login cookie is missing"))
+	c, err := parseClaims(t.idToken)
+	if err == nil {
+		err = m.checkLogin(c, l.Nonce, req.cert)
+	}
+	if err != nil {
+		return req.deny(http.StatusForbidden, err, zap.String("sub", c.Subject))
+	}
+
+	now := m.now()
+	cookie, err := m.seal(sessionCookie, session{
+		IDToken:      t.idToken,
+		RefreshToken: t.refreshToken,
+		RefreshedAt:  now.Unix(),
+		ExpiresAt:    now.Add(sessionLifetime).Unix(),
+		Host:         req.r.Host,
+		Certificate:  req.cert,
+	}, int(sessionLifetime.Seconds()))
+	if err != nil {
+		req.log.Error("login failed", zap.String("sub", c.Subject), zap.Error(err))
+		return caddyhttp.Error(http.StatusInternalServerError, err)
+	}
+	http.SetCookie(req.w, cookie)
+	req.log.Info("user logged in", zap.String("sub", c.Subject))
+
+	if !isLocalPath(l.Redirect) {
+		l.Redirect = "/"
+	}
+	http.Redirect(req.w, req.r, l.Redirect, http.StatusFound)
+	return nil
 }
 
-func takeLogin(req *request, state string) (pendingLogin, error) {
-	value := req.logins[state]
-	delete(req.logins, state)
-	setCookie(req.w, loginCookie+state, "", -time.Second)
-
-	l, err := decodeLogin(value)
-	if err != nil || l.State != state {
-		return pendingLogin{}, deny(http.StatusBadRequest, errors.New("login cookie is invalid"))
-	}
-	return l, nil
-}
-
-func (m *Auth) checkLogin(c *claims, nonce, uri string) error {
+func (m *Auth) checkLogin(c claims, nonce, cert string) error {
 	switch {
 	case c.Subject == "":
 		return errors.New("ID token has no subject")
 	case c.Nonce != nonce:
 		return errors.New("ID token nonce does not match")
-	case uri != "" && certificateOwner(uri) != c.Subject:
+	case !m.DisableClientCertificate && certificateOwner(cert) != c.Subject:
 		return errors.New("client certificate belongs to another user")
 	case !slices.Contains(c.AMR, "phr"):
 		return errors.New("login did not use a passkey")
 	case m.now().Sub(time.Unix(c.AuthTime, 0)) > maxAuthAge:
-		return errLoginTooOld
+		return errors.New("login is older than 1 hour")
 	}
 	return nil
 }
 
 func (m *Auth) logout(req *request) error {
-	if err := crossOrigin.Check(req.r); err != nil {
-		return deny(http.StatusForbidden, err)
+	if err := crossOrigin.Check(req.orig); err != nil {
+		return req.deny(http.StatusForbidden, err)
 	}
-	idToken := m.endSession(req)
-	http.Redirect(req.w, req.r, m.idp.logoutURL(idToken, "https://"+req.r.Host+"/"), http.StatusSeeOther)
+	expire(req.w, sessionCookie)
+	var s session
+	if m.open(sessionCookie, req.session, &s) == nil {
+		c, _ := parseClaims(s.IDToken)
+		req.log.Info("user logged out", zap.String("sub", c.Subject))
+	}
+	http.Redirect(req.w, req.r, m.idp.logoutURL(s.IDToken, "https://"+req.r.Host+"/"), http.StatusSeeOther)
 	return nil
-}
-
-func (l pendingLogin) cookie() string {
-	value := l.encode()
-	if len(loginCookie)+len(l.State)+len(value) > maxCookieSize {
-		l.Redirect = ""
-		value = l.encode()
-	}
-	return value
-}
-
-func (l pendingLogin) encode() string {
-	var b bytes.Buffer
-	enc := json.NewEncoder(&b)
-	enc.SetEscapeHTML(false)
-	_ = enc.Encode(l)
-	return base64.RawURLEncoding.EncodeToString(b.Bytes())
-}
-
-func decodeLogin(value string) (pendingLogin, error) {
-	var l pendingLogin
-	data, err := base64.RawURLEncoding.DecodeString(value)
-	if err == nil {
-		err = json.Unmarshal(data, &l)
-	}
-	return l, err
-}
-
-func redirectLocal(req *request, p string) {
-	if !isLocalPath(p) {
-		p = "/"
-	}
-	http.Redirect(req.w, req.r, p, http.StatusFound)
 }
 
 func isLocalPath(p string) bool {

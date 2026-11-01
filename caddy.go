@@ -1,6 +1,7 @@
 package castelnuovo
 
 import (
+	"crypto/cipher"
 	"errors"
 	"net/http"
 	"time"
@@ -10,29 +11,28 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 )
 
 func init() {
-	caddy.RegisterModule(Auth{})
+	caddy.RegisterModule(new(Auth))
 	httpcaddyfile.RegisterHandlerDirective("castelnuovo_auth", parseCaddyfile)
 	httpcaddyfile.RegisterDirectiveOrder("castelnuovo_auth", httpcaddyfile.Before, "basic_auth")
 }
-
-var stores = caddy.NewUsagePool()
 
 type Auth struct {
 	ClientID                 string `json:"client_id"`
 	ClientSecret             string `json:"client_secret"`
 	DisableClientCertificate bool   `json:"disable_client_certificate,omitempty"`
 
-	storeKey string
-	store    *store
-	idp      pocketID
-	now      func() time.Time
-	log      *zap.Logger
+	aead      cipher.AEAD
+	idp       pocketID
+	refreshes singleflight.Group
+	now       func() time.Time
+	log       *zap.Logger
 }
 
-func (Auth) CaddyModule() caddy.ModuleInfo {
+func (*Auth) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.castelnuovo_auth",
 		New: func() caddy.Module { return new(Auth) },
@@ -41,8 +41,7 @@ func (Auth) CaddyModule() caddy.ModuleInfo {
 
 func (m *Auth) Provision(ctx caddy.Context) error {
 	repl := caddy.NewReplacer()
-	clientID := repl.ReplaceAll(m.ClientID, "")
-	secret := repl.ReplaceAll(m.ClientSecret, "")
+	clientID, secret := repl.ReplaceAll(m.ClientID, ""), repl.ReplaceAll(m.ClientSecret, "")
 	switch {
 	case clientID == "":
 		return errors.New("client_id is empty")
@@ -50,21 +49,15 @@ func (m *Auth) Provision(ctx caddy.Context) error {
 		return errors.New("client_secret is empty")
 	}
 
-	st, _, err := stores.LoadOrNew(clientID, func() (caddy.Destructor, error) { return newStore(), nil })
+	aead, err := newAEAD(secret)
 	if err != nil {
 		return err
 	}
-	m.storeKey = clientID
-	m.store = st.(*store)
+	m.aead = aead
 	m.idp = newOIDC(issuer, clientID, secret, &http.Client{Timeout: 10 * time.Second})
 	m.now = time.Now
 	m.log = ctx.Logger()
 	return nil
-}
-
-func (m *Auth) Cleanup() error {
-	_, err := stores.Delete(m.storeKey)
-	return err
 }
 
 func (m *Auth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
@@ -108,7 +101,6 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 
 var (
 	_ caddy.Provisioner           = (*Auth)(nil)
-	_ caddy.CleanerUpper          = (*Auth)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Auth)(nil)
 	_ caddyfile.Unmarshaler       = (*Auth)(nil)
 )

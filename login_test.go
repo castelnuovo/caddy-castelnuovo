@@ -1,8 +1,6 @@
 package castelnuovo
 
 import (
-	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -10,189 +8,230 @@ import (
 	"time"
 )
 
+func TestLogin(t *testing.T) {
+	m, idp := newTest(t)
+	resp := get(t, m, loginPath+"?rd=%2Fpage", cert)
+	login := pending(resp)
+	location := must(url.Parse(resp.Header.Get("Location")))
+	query := location.Query()
+	if resp.StatusCode != http.StatusFound || location.Scheme+"://"+location.Host+location.Path != issuer+"/authorize" || login == nil || login.Name != loginCookie+query.Get("state") || login.MaxAge != 600 {
+		t.Fatalf("login: %d %s %v", resp.StatusCode, location, resp.Cookies())
+	}
+	if query.Get("redirect_uri") != "https://"+host+callbackPath || query.Get("code_challenge_method") != "S256" || query.Get("max_age") != "3600" || query.Get("nonce") == "" || query.Has("prompt") {
+		t.Fatalf("authorize URL %s", location)
+	}
+
+	resp = finishLogin(t, m, idp, resp, cert)
+	session, expired := cookieNamed(resp, sessionCookie), cookieNamed(resp, login.Name)
+	if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/page" || session == nil || session.MaxAge != int(sessionLifetime.Seconds()) || expired == nil || expired.MaxAge >= 0 {
+		t.Fatalf("callback: %d %s %v", resp.StatusCode, resp.Header.Get("Location"), resp.Cookies())
+	}
+}
+
 func TestLoginRejects(t *testing.T) {
 	tests := map[string]struct {
 		uri    string
 		change func(*fakePocketID)
 	}{
-		"certificate of another user":                   {otherCert, func(*fakePocketID) {}},
-		"certificate of another user without a passkey": {otherCert, func(f *fakePocketID) { f.claims.AMR = nil }},
-		"nonce does not match":                          {cert, func(f *fakePocketID) { f.claims.Nonce = "other" }},
-		"no subject":                                    {cert, func(f *fakePocketID) { f.claims.Subject = "" }},
-		"no passkey":                                    {cert, func(f *fakePocketID) { f.claims.AMR = []string{"otp"} }},
-		"code rejected":                                 {cert, func(f *fakePocketID) { f.exchangeErr = errors.New("invalid_grant") }},
+		"nonce does not match":        {cert, func(f *fakePocketID) { f.user.Nonce = "other" }},
+		"no subject":                  {cert, func(f *fakePocketID) { f.user.Subject = "" }},
+		"no passkey":                  {cert, func(f *fakePocketID) { f.user.AMR = []string{"pwd"} }},
+		"login older than an hour":    {cert, func(f *fakePocketID) { f.user.AuthTime = f.now().Add(-maxAuthAge - time.Second).Unix() }},
+		"certificate of another user": {otherCert, func(*fakePocketID) {}},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			s, idp := newTest()
+			m, idp := newTest(t)
 			tt.change(idp)
-			if resp := logIn(t, s, tt.uri); resp.StatusCode != http.StatusForbidden || cookie(resp, sessionCookie) != nil {
-				t.Fatalf("status %d", resp.StatusCode)
+			resp := finishLogin(t, m, idp, get(t, m, loginPath, tt.uri), tt.uri)
+			if resp.StatusCode != http.StatusForbidden || cookieNamed(resp, sessionCookie) != nil || pending(resp) != nil || resp.Header.Get("Location") != "" {
+				t.Fatalf("%d %s %v", resp.StatusCode, resp.Header.Get("Location"), resp.Cookies())
 			}
 		})
 	}
 }
 
-func TestOldLoginAsksAgain(t *testing.T) {
-	s, idp := newTest()
-	fresh := idp.claims.AuthTime
-	idp.claims.AuthTime = time.Now().Add(-2 * time.Hour).Unix()
-
-	first := logIn(t, s, cert)
-	location, _ := url.Parse(first.Header.Get("Location"))
-	if first.StatusCode != http.StatusFound || location.Query().Get("prompt") != "login" || cookie(first, sessionCookie) != nil {
-		t.Fatalf("first login: %d %s", first.StatusCode, location)
-	}
-	if resp := finishLogin(s, first, cert); resp.StatusCode != http.StatusForbidden || cookie(resp, sessionCookie) != nil {
-		t.Fatalf("new login that is still too old: %d", resp.StatusCode)
+func TestLoginFailsAtIdentityProvider(t *testing.T) {
+	m, idp := newTest(t)
+	resp := get(t, m, loginPath, cert)
+	state := must(url.Parse(resp.Header.Get("Location"))).Query().Get("state")
+	if resp := get(t, m, callbackPath+"?error=access_denied&state="+state, cert, pending(resp)); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("error from the identity provider: %d", resp.StatusCode)
 	}
 
-	first = logIn(t, s, cert)
-	idp.claims.AuthTime = fresh
-	if resp := finishLogin(s, first, cert); resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/page" || cookie(resp, sessionCookie) == nil {
-		t.Fatalf("new login: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	idp.down = true
+	if resp := finishLogin(t, m, idp, get(t, m, loginPath, cert), cert); resp.StatusCode != http.StatusBadGateway || cookieNamed(resp, sessionCookie) != nil {
+		t.Fatalf("identity provider down: %d", resp.StatusCode)
 	}
 }
 
-func TestCallbackNeedsItsOwnLogin(t *testing.T) {
-	s, idp := newTest()
-	resp := get(s, "/.castelnuovo/login", cert)
-	location, _ := url.Parse(resp.Header.Get("Location"))
-	state := location.Query().Get("state")
-	callback := "/.castelnuovo/callback?code=" + location.Query().Get("code") + "&state=" + state
-	login := cookie(resp, loginCookie+state)
+func TestLoginNeedsPKCE(t *testing.T) {
+	m, idp := newTest(t)
+	attacker := must(url.Parse(idp.authorize(get(t, m, loginPath, cert).Header.Get("Location")))).Query()
+	victim := get(t, m, loginPath, cert)
+	query := must(url.Parse(victim.Header.Get("Location"))).Query()
+	idp.user.Nonce = query.Get("nonce")
 
-	if resp := get(s, callback, cert); resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("without login cookie: %d", resp.StatusCode)
+	resp := get(t, m, callbackPath+"?"+url.Values{"code": {attacker.Get("code")}, "state": {query.Get("state")}}.Encode(), cert, pending(victim))
+	if resp.StatusCode != http.StatusForbidden || cookieNamed(resp, sessionCookie) != nil {
+		t.Fatalf("code of another login: %d", resp.StatusCode)
 	}
-	if resp := get(s, "/.castelnuovo/callback?code=c&state=other", cert, login); resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("with another state: %d", resp.StatusCode)
+}
+
+func TestCallbackNeedsItsPendingLogin(t *testing.T) {
+	m, idp := newTest(t)
+	first, second := get(t, m, loginPath, cert), get(t, m, loginPath, cert)
+	callback := idp.authorize(first.Header.Get("Location"))
+	state := must(url.Parse(callback)).Query().Get("state")
+	tampered := *pending(first)
+	tampered.Value = tamper(tampered.Value)
+
+	for name, cookies := range map[string][]*http.Cookie{
+		"another browser":       nil,
+		"another pending login": {pending(second)},
+		"renamed login cookie":  {{Name: loginCookie + state, Value: pending(second).Value}},
+		"tampered login cookie": {&tampered},
+	} {
+		if resp := get(t, m, callback, cert, cookies...); resp.StatusCode != http.StatusBadRequest || cookieNamed(resp, sessionCookie) != nil {
+			t.Fatalf("%s: %d", name, resp.StatusCode)
+		}
 	}
-	if resp := get(s, callback, cert, &http.Cookie{Name: login.Name, Value: "forged"}); resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("with a forged login cookie: %d", resp.StatusCode)
-	}
-	if resp := get(s, "/.castelnuovo/callback?error=access_denied&state="+state, cert, login); resp.StatusCode != http.StatusForbidden || idp.exchanges != 0 {
-		t.Fatalf("with an error from the identity provider: %d, %d exchanges", resp.StatusCode, idp.exchanges)
-	}
-	if resp := get(s, callback, otherCert, login); resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("with another certificate: %d", resp.StatusCode)
+	if resp := get(t, m, callbackPath+"?code=x", cert, pending(first)); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("without state: %d", resp.StatusCode)
 	}
 
-	done := get(s, callback, cert, login)
-	if deleted := cookie(done, login.Name); done.StatusCode != http.StatusFound || deleted == nil || deleted.MaxAge >= 0 {
-		t.Fatalf("callback keeps the login cookie: %d", done.StatusCode)
-	}
-	if resp := get(s, callback, cert); resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("used twice: %d", resp.StatusCode)
-	}
-	if resp := get(s, callback, cert, cookie(done, sessionCookie)); resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/" {
-		t.Fatalf("used twice with a session: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	session := cookieNamed(get(t, m, callback, cert, pending(first)), sessionCookie)
+	if resp := get(t, m, callback, cert, session); session == nil || resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("replayed callback: %d", resp.StatusCode)
 	}
 }
 
 func TestConcurrentLogins(t *testing.T) {
-	s, _ := newTest()
-	first := get(s, "/.castelnuovo/login?rd=%2Fone", cert)
-	second := get(s, "/.castelnuovo/login?rd=%2Ftwo", cert, pending(first))
-
-	if resp := finishLogin(s, first, cert, pending(second)); resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/one" {
-		t.Fatalf("first login: %d %s", resp.StatusCode, resp.Header.Get("Location"))
-	}
-	if resp := finishLogin(s, second, cert); resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/two" {
-		t.Fatalf("second login: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	m, idp := newTest(t)
+	first, second := get(t, m, loginPath+"?rd=%2Ffirst", cert), get(t, m, loginPath+"?rd=%2Fsecond", cert)
+	both := []*http.Cookie{pending(first), pending(second)}
+	for login, want := range map[*http.Response]string{second: "/second", first: "/first"} {
+		resp := get(t, m, idp.authorize(login.Header.Get("Location")), cert, both...)
+		if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != want || cookieNamed(resp, sessionCookie) == nil {
+			t.Fatalf("%s: %d %s", want, resp.StatusCode, resp.Header.Get("Location"))
+		}
 	}
 }
 
 func TestPendingLoginsAreLimited(t *testing.T) {
-	s, _ := newTest()
+	m, _ := newTest(t)
 	var logins []*http.Cookie
 	for range maxPendingLogins {
-		resp := get(s, loginPath, cert, logins...)
+		resp := get(t, m, loginPath, cert, logins...)
 		if len(resp.Cookies()) != 1 {
-			t.Fatalf("login %d changed %d cookies", len(logins)+1, len(resp.Cookies()))
+			t.Fatalf("login %d set %v", len(logins)+1, resp.Cookies())
 		}
 		logins = append(logins, pending(resp))
 	}
 
-	resp := get(s, loginPath, cert, logins...)
-	for _, login := range logins {
-		if deleted := cookie(resp, login.Name); deleted == nil || deleted.MaxAge >= 0 {
-			t.Fatalf("%s was kept", login.Name)
+	resp := get(t, m, loginPath, cert, logins...)
+	expired := 0
+	for _, c := range resp.Cookies() {
+		if c.MaxAge < 0 {
+			expired++
 		}
 	}
-	if pending(resp) == nil {
-		t.Fatal("no new login")
+	if expired != maxPendingLogins || pending(resp) == nil {
+		t.Fatalf("login after %d pending logins set %v", maxPendingLogins, resp.Cookies())
 	}
 }
 
 func TestLongRedirect(t *testing.T) {
-	s, _ := newTest()
-	query := "/p?" + strings.Repeat("&a=b", 400)
+	m, idp := newTest(t)
 	for rd, want := range map[string]string{
-		query:                           query,
-		"/" + strings.Repeat("a", 5000): "/",
+		"/" + strings.Repeat("a", 2000):  "/" + strings.Repeat("a", 2000),
+		"/" + strings.Repeat("a&", 3000): "/",
 	} {
-		resp := get(s, "/.castelnuovo/login?rd="+url.QueryEscape(rd), cert)
-		if login := pending(resp); len(login.Name)+len(login.Value) > maxCookieSize {
-			t.Fatalf("rd of %d bytes: login cookie has %d bytes", len(rd), len(login.Name)+len(login.Value))
-		}
-		if resp := finishLogin(s, resp, cert); resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != want {
-			t.Fatalf("rd of %d bytes: %d, Location of %d bytes", len(rd), resp.StatusCode, len(resp.Header.Get("Location")))
+		resp := finishLogin(t, m, idp, get(t, m, loginPath+"?rd="+url.QueryEscape(rd), cert), cert)
+		if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != want {
+			t.Fatalf("redirect of %d bytes: %d, location of %d bytes", len(rd), resp.StatusCode, len(resp.Header.Get("Location")))
 		}
 	}
 }
 
-func TestNoOpenRedirect(t *testing.T) {
-	for _, rd := range []string{"//evil.example", "https://evil.example", "/\\evil.example", "/\t/evil.example", "/\n/evil.example", "/\x00x", ""} {
-		if isLocalPath(rd) {
-			t.Fatalf("%q is treated as local", rd)
+func TestRedirectsOnlyToLocalPaths(t *testing.T) {
+	m, idp := newTest(t)
+	for rd, want := range map[string]string{
+		"/page?x=1&y=2":           "/page?x=1&y=2",
+		"":                        "/",
+		"page":                    "/",
+		"https://evil.example":    "/",
+		"//evil.example":          "/",
+		`/\evil.example`:          "/",
+		`\\evil.example`:          "/",
+		"/page\r\nSet-Cookie: x":  "/",
+		"/page\tx":                "/",
+		"javascript:alert(1)":     "/",
+		"https://" + host + "/ok": "/",
+	} {
+		resp := finishLogin(t, m, idp, get(t, m, loginPath+"?rd="+url.QueryEscape(rd), cert), cert)
+		if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != want {
+			t.Fatalf("rd %q: %d %q", rd, resp.StatusCode, resp.Header.Get("Location"))
 		}
-	}
-
-	s, _ := newTest()
-	resp := finishLogin(s, get(s, "/.castelnuovo/login?rd="+url.QueryEscape("/\t/evil.example"), cert), cert)
-	if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/" {
-		t.Fatalf("callback: %d %q", resp.StatusCode, resp.Header.Get("Location"))
 	}
 }
 
 func TestLogout(t *testing.T) {
-	s, idp := newTest()
-	session := cookie(logIn(t, s, cert), sessionCookie)
+	m, idp := newTest(t)
+	session := logIn(t, m, idp, cert)
 
-	req := httpRequest(http.MethodPost, "/.castelnuovo/logout", cert)
-	req.Header.Set("Sec-Fetch-Site", "cross-site")
-	if resp := serve(s, req); resp.StatusCode != http.StatusForbidden || cookie(resp, sessionCookie) != nil {
-		t.Fatalf("cross-site POST: %d", resp.StatusCode)
+	for name, header := range map[string][2]string{
+		"cross site":        {"Sec-Fetch-Site", "cross-site"},
+		"same site":         {"Sec-Fetch-Site", "same-site"},
+		"another host":      {"Origin", "https://evil.example"},
+		"another port":      {"Origin", "https://" + host + ":8443"},
+		"another subdomain": {"Origin", "https://other.castelnuovo.eu"},
+	} {
+		req := httpRequest(http.MethodPost, logoutPath, cert, session)
+		req.Header.Set(header[0], header[1])
+		if resp := serve(t, m, req); resp.StatusCode != http.StatusForbidden || len(resp.Cookies()) != 0 {
+			t.Fatalf("%s: %d %v", name, resp.StatusCode, resp.Cookies())
+		}
 	}
 
-	later := time.Now().Add(refreshInterval + time.Minute)
-	s.now = func() time.Time { return later }
-	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusOK {
-		t.Fatalf("refresh: %d", resp.StatusCode)
+	var hint string
+	for name, cookies := range map[string][]*http.Cookie{
+		"with session":    {session},
+		"without session": nil,
+		"invalid session": {{Name: sessionCookie, Value: "invalid"}},
+	} {
+		req := httpRequest(http.MethodPost, logoutPath, cert, cookies...)
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		resp := serve(t, m, req)
+		location := must(url.Parse(resp.Header.Get("Location")))
+		query, expired := location.Query(), cookieNamed(resp, sessionCookie)
+		if resp.StatusCode != http.StatusSeeOther || location.Scheme+"://"+location.Host+location.Path != issuer+"/api/oidc/end-session" || query.Get("post_logout_redirect_uri") != "https://"+host+"/" || query.Get("client_id") != clientID || expired == nil || expired.MaxAge >= 0 {
+			t.Fatalf("%s: %d %s %v", name, resp.StatusCode, location, resp.Cookies())
+		}
+		if (name == "with session") != query.Has("id_token_hint") {
+			t.Fatalf("%s: hint %q", name, query.Get("id_token_hint"))
+		}
+		if name == "with session" {
+			hint = query.Get("id_token_hint")
+		}
 	}
-
-	resp := serve(s, httpRequest(http.MethodPost, "/.castelnuovo/logout", cert, session))
-	if cleared := cookie(resp, sessionCookie); resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != idp.logoutURL("refreshed-id-token", "https://"+host+"/") || cleared == nil || cleared.MaxAge >= 0 {
-		t.Fatalf("POST: %d %s", resp.StatusCode, resp.Header.Get("Location"))
-	}
-
-	if resp := get(s, "/page", cert, session); resp.StatusCode != http.StatusFound {
-		t.Fatalf("after logout: %d", resp.StatusCode)
-	}
-	if resp := serve(s, httpRequest(http.MethodPost, "/.castelnuovo/logout", cert, session)); resp.Header.Get("Location") != idp.logoutURL("", "https://"+host+"/") {
-		t.Fatalf("POST without a session: %s", resp.Header.Get("Location"))
+	if c, err := parseClaims(hint); err != nil || c.Subject != sub {
+		t.Fatalf("hint is not the ID token: %v %+v", err, c)
 	}
 }
 
-func TestCallbackWithoutLoginDuringOutage(t *testing.T) {
-	s, idp := newTest()
-	session := cookie(logIn(t, s, cert), sessionCookie)
+func TestLogoutEndsLoginAtIdentityProvider(t *testing.T) {
+	m, idp := newTest(t)
+	session := logIn(t, m, idp, cert)
+	idp.endSession(serve(t, m, httpRequest(http.MethodPost, logoutPath, cert, session)).Header.Get("Location"))
 
-	idp.refreshErr = fmt.Errorf("%w: connection refused", errUnavailable)
-	later := time.Now().Add(refreshInterval + time.Minute)
-	s.now = func() time.Time { return later }
-	if resp := get(s, "/.castelnuovo/callback?code=c&state=gone", cert, session); resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status %d", resp.StatusCode)
+	idp.advance(refreshInterval - time.Second)
+	if resp := get(t, m, "/page", cert, session); resp.StatusCode != http.StatusOK {
+		t.Fatalf("copied cookie before its next refresh: %d", resp.StatusCode)
+	}
+	idp.advance(time.Second)
+	resp := get(t, m, "/page", cert, session)
+	if expired := cookieNamed(resp, sessionCookie); resp.StatusCode != http.StatusFound || expired == nil || expired.MaxAge >= 0 {
+		t.Fatalf("copied cookie at its next refresh: %d %v", resp.StatusCode, resp.Cookies())
 	}
 }
